@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "rdquant"
+version = "0.1.0"
+description = "Data-free channel-wise mixed-precision quantization for LLMs via Rate-Distortion optimization"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+eval = ["lm-eval>=0.4", "datasets>=2.0"]
+dev = ["pytest>=7.0", "matplotlib>=3.7"]
+
+[project.urls]
+Homepage = "https://github.com/rdquant/rdquant"
+Repository = "https://github.com/rdquant/rdquant"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rdquant*"]
