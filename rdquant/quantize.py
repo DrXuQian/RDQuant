@@ -103,7 +103,10 @@ class QuantizedLayer(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run fake-quantization forward: dequant weight then linear.
+        """Mixed-precision forward: per-format dequant → GEMM → concat → permute.
+
+        Uses grouped GEMMs (one per format) so each can later be swapped for
+        a native Tensor Core kernel.
 
         Args:
             x: Input tensor of shape [..., in_features].
@@ -111,8 +114,12 @@ class QuantizedLayer(nn.Module):
         Returns:
             Output tensor of shape [..., out_features].
         """
-        weight = self.quantized_weight.dequantize()
-        return F.linear(x, weight, self.bias)
+        from rdquant.ops import mixed_precision_linear
+
+        qw = self.quantized_weight
+        return mixed_precision_linear(
+            x, qw.qtensors, qw.splits, qw.inv_permutation, self.bias,
+        )
 
     def extra_repr(self) -> str:
         return (
