@@ -44,13 +44,8 @@ def parse_args() -> argparse.Namespace:
         "--formats",
         type=str,
         nargs="+",
-        default=["MXFP4", "MXFP6", "MXFP8"],
-        help="Allowed quantization formats (MX-only: MXFP4, MXFP6, MXFP8).",
-    )
-    parser.add_argument(
-        "--no-act-quant",
-        action="store_true",
-        help="Disable MXFP8 activation quantization.",
+        default=["NVFP4", "FP8", "FP16"],
+        help="Allowed quantization formats (NVFP4, FP8, FP16).",
     )
     parser.add_argument(
         "--eval",
@@ -89,15 +84,12 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Original model: {n_params:,} parameters ({n_params * 2 / 1e6:.1f} MB in FP16)")
 
-    act_quant = not args.no_act_quant
-    print(f"\nQuantizing with budget={args.budget} bits, formats={args.formats}, "
-          f"act_quant={'MXFP8' if act_quant else 'none'}")
+    print(f"\nQuantizing with budget={args.budget} bits, formats={args.formats}")
     qmodel = quantize_model(
         model,
         budget_avg_bits=args.budget,
         formats=args.formats,
         ignore=args.ignore,
-        quantize_activation=act_quant,
     )
     qmodel = qmodel.to(args.device)
 

@@ -20,7 +20,7 @@ from rdquant.core.formats import get_bits_per_element
 torch.manual_seed(42)
 
 METRICS = ["mse", "weighted_mse", "max_over_std", "kurtosis", "range_ratio"]
-FORMATS = ["MXFP4", "MXFP6", "MXFP8"]
+FORMATS = ["NVFP4", "FP8", "FP16"]
 
 
 def _rand_weight(n_out: int, n_in: int, seed: int = 42) -> torch.Tensor:
@@ -86,11 +86,11 @@ class TestSensitivityOrdering:
             scores = compute_sensitivity(w, metric="mse", base_format=fmt)
             assert scores.shape == (8,)
 
-    def test_default_base_format_is_mxfp4(self):
-        """Default base_format should be MXFP4."""
+    def test_default_base_format_is_nvfp4(self):
+        """Default base_format should be NVFP4."""
         w = _rand_weight(8, 64)
         s1 = compute_sensitivity(w, metric="mse")
-        s2 = compute_sensitivity(w, metric="mse", base_format="MXFP4")
+        s2 = compute_sensitivity(w, metric="mse", base_format="NVFP4")
         assert torch.allclose(s1, s2)
 
 
@@ -202,7 +202,7 @@ class TestComputeRDPoints:
                 assert entry["rate"] == get_bits_per_element(entry["format"])
 
     def test_distortion_ordering(self):
-        """For each channel: D(MXFP4) >= D(MXFP6) >= D(MXFP8)."""
+        """For each channel: D(NVFP4) >= D(FP8) >= D(FP16)."""
         w = _rand_weight(16, 128)
         rd = compute_rd_points(w, FORMATS)
         fmt_order = {f: i for i, f in enumerate(FORMATS)}
@@ -219,20 +219,20 @@ class TestComputeRDPoints:
             for entry in entries:
                 assert entry["distortion"] >= 0.0
 
-    def test_mxfp8_distortion_small(self):
+    def test_fp16_distortion_near_zero(self):
         w = _rand_weight(8, 64)
         rd = compute_rd_points(w, FORMATS)
         for j, entries in rd.items():
-            mxfp8_entry = next(e for e in entries if e["format"] == "MXFP8")
-            assert mxfp8_entry["distortion"] < 0.01
+            fp16_entry = next(e for e in entries if e["format"] == "FP16")
+            assert fp16_entry["distortion"] < 1e-6
 
     def test_custom_format_subset(self):
         w = _rand_weight(4, 32)
-        rd = compute_rd_points(w, formats=["MXFP4", "MXFP8"])
+        rd = compute_rd_points(w, formats=["NVFP4", "FP16"])
         for j, entries in rd.items():
             assert len(entries) == 2
             fmts = {e["format"] for e in entries}
-            assert fmts == {"MXFP4", "MXFP8"}
+            assert fmts == {"NVFP4", "FP16"}
 
     @pytest.mark.parametrize("n_out,n_in", [(4, 32), (16, 128)])
     def test_various_shapes(self, n_out, n_in):
@@ -248,12 +248,12 @@ class TestComputeRDPoints:
                 assert entry["distortion"] == 0.0
 
     def test_default_formats(self):
-        """Default formats should be MXFP4, MXFP6, MXFP8."""
+        """Default formats should be NVFP4, FP8, FP16."""
         w = _rand_weight(4, 32)
         rd = compute_rd_points(w)
         for j, entries in rd.items():
             fmts = {e["format"] for e in entries}
-            assert fmts == {"MXFP4", "MXFP6", "MXFP8"}
+            assert fmts == {"NVFP4", "FP8", "FP16"}
 
 
 # ---------------------------------------------------------------------------

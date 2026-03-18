@@ -2,12 +2,13 @@
 Tests for rdquant/core/formats.py
 
 Covers:
-  - Round-trip correctness for all MX formats (MXFP4, MXFP6, MXFP8)
-  - MSE monotonicity: MXFP4 >= MXFP6 >= MXFP8
+  - Round-trip correctness for all formats (NVFP4, FP8, FP16)
+  - MSE monotonicity: NVFP4 >= FP8 >= FP16 ~= 0
   - Edge cases: all-zero, single-value, large outlier
-  - Block scale correctness
+  - NVFP4 block scale is FP8 E4M3 representable
+  - FP8 per-channel scale
   - Various tensor sizes
-  - MXQuantizedTensor fields
+  - QuantizedTensor fields
 """
 
 import math
@@ -16,28 +17,29 @@ import pytest
 import torch
 
 from rdquant.core.formats import (
-    MXQuantizedTensor,
-    _MXFP4_LUT,
-    _MXFP6_LUT,
-    _MXFP8_E4M3_LUT,
-    _MX_BLOCK_SIZE,
+    QuantizedTensor,
+    _NVFP4_LUT,
+    _NVFP4_POS_VALUES,
+    _NVFP4_BLOCK_SIZE,
+    _FP8_E4M3_MAX,
+    _quantize_to_fp8_e4m3,
     compute_mse,
     compute_mse_2d,
     dequantize,
     get_bits_per_element,
-    mxfp4_dequantize,
-    mxfp4_quantize,
-    mxfp6_dequantize,
-    mxfp6_quantize,
-    mxfp8_dequantize,
-    mxfp8_quantize,
+    nvfp4_quantize,
+    nvfp4_dequantize,
+    fp8_quantize,
+    fp8_dequantize,
+    fp16_quantize,
+    fp16_dequantize,
     quantize,
 )
 
 torch.manual_seed(42)
 
-FORMATS = ["MXFP4", "MXFP6", "MXFP8"]
-SIZES = [32, 64, 128, 256, 1024, 4096]
+FORMATS = ["NVFP4", "FP8", "FP16"]
+SIZES = [16, 32, 64, 128, 256, 1024, 4096]
 
 
 # ---------------------------------------------------------------------------
@@ -54,49 +56,49 @@ def _rand_tensor(n: int, seed: int = 42) -> torch.Tensor:
 # bits_per_element
 # ---------------------------------------------------------------------------
 
-def test_bits_per_element_mxfp4():
-    assert get_bits_per_element("MXFP4") == 4
+def test_bits_per_element_nvfp4():
+    assert get_bits_per_element("NVFP4") == 4
 
-def test_bits_per_element_mxfp6():
-    assert get_bits_per_element("MXFP6") == 6
+def test_bits_per_element_fp8():
+    assert get_bits_per_element("FP8") == 8
 
-def test_bits_per_element_mxfp8():
-    assert get_bits_per_element("MXFP8") == 8
+def test_bits_per_element_fp16():
+    assert get_bits_per_element("FP16") == 16
 
 def test_bits_per_element_unknown_raises():
     with pytest.raises(KeyError):
-        get_bits_per_element("FP16")
+        get_bits_per_element("MXFP4")
 
 
 # ---------------------------------------------------------------------------
-# Round-trip: MXFP4
+# Round-trip: NVFP4
 # ---------------------------------------------------------------------------
 
-class TestMXFP4RoundTrip:
+class TestNVFP4RoundTrip:
     def test_basic_shape(self):
         t = _rand_tensor(128)
-        qt = mxfp4_quantize(t)
-        recon = mxfp4_dequantize(qt)
+        qt = nvfp4_quantize(t)
+        recon = nvfp4_dequantize(qt)
         assert recon.shape == t.shape
 
     def test_zero_tensor(self):
-        t = torch.zeros(32)
-        qt = mxfp4_quantize(t)
-        recon = mxfp4_dequantize(qt)
+        t = torch.zeros(16)
+        qt = nvfp4_quantize(t)
+        recon = nvfp4_dequantize(qt)
         assert torch.allclose(recon, t)
 
     def test_single_element(self):
         t = torch.tensor([3.14])
-        qt = mxfp4_quantize(t)
-        recon = mxfp4_dequantize(qt)
+        qt = nvfp4_quantize(t)
+        recon = nvfp4_dequantize(qt)
         assert recon.shape == t.shape
 
     def test_large_outlier(self):
-        t = torch.zeros(32)
+        t = torch.zeros(16)
         t[0] = 1000.0
         t[1] = -1000.0
-        qt = mxfp4_quantize(t)
-        recon = mxfp4_dequantize(qt)
+        qt = nvfp4_quantize(t)
+        recon = nvfp4_dequantize(qt)
         assert recon.shape == t.shape
         assert recon[0] > 0
         assert recon[1] < 0
@@ -104,166 +106,162 @@ class TestMXFP4RoundTrip:
     @pytest.mark.parametrize("n", SIZES)
     def test_various_sizes(self, n):
         t = _rand_tensor(n)
-        qt = mxfp4_quantize(t)
-        recon = mxfp4_dequantize(qt)
+        qt = nvfp4_quantize(t)
+        recon = nvfp4_dequantize(qt)
         assert recon.shape == t.shape
 
     def test_indices_in_range(self):
         t = _rand_tensor(64)
-        qt = mxfp4_quantize(t)
+        qt = nvfp4_quantize(t)
         assert qt.data.min() >= 0
         assert qt.data.max() <= 15
 
     def test_format_name(self):
         t = _rand_tensor(64)
-        qt = mxfp4_quantize(t)
-        assert qt.format_name == "MXFP4"
+        qt = nvfp4_quantize(t)
+        assert qt.format_name == "NVFP4"
 
     def test_bits_per_element_field(self):
         t = _rand_tensor(64)
-        qt = mxfp4_quantize(t)
+        qt = nvfp4_quantize(t)
         assert qt.bits_per_element == 4
 
     def test_scale_count(self):
-        for n in [32, 33, 64, 100, 128]:
+        for n in [16, 17, 32, 64, 100, 128]:
             t = _rand_tensor(n)
-            qt = mxfp4_quantize(t)
-            expected_blocks = math.ceil(n / _MX_BLOCK_SIZE)
+            qt = nvfp4_quantize(t)
+            expected_blocks = math.ceil(n / _NVFP4_BLOCK_SIZE)
             assert qt.scales.shape[0] == expected_blocks
 
-    def test_scale_positive_or_zero(self):
+    def test_scale_fp8_representable(self):
+        """Block scales should be FP8 E4M3 representable."""
         t = _rand_tensor(128)
-        qt = mxfp4_quantize(t)
-        # shared exponents can be negative (floor(log2(absmax)))
-        # just check they're finite
-        assert torch.isfinite(qt.scales).all()
+        qt = nvfp4_quantize(t)
+        # Verify scales survive FP8 round-trip
+        scales_rt = _quantize_to_fp8_e4m3(qt.scales)
+        assert torch.allclose(qt.scales, scales_rt)
+
+    def test_global_scale_present(self):
+        t = _rand_tensor(128)
+        qt = nvfp4_quantize(t)
+        assert qt.global_scale is not None
+        assert qt.global_scale > 0
 
     def test_zero_block_scale(self):
-        t = torch.zeros(32)
-        qt = mxfp4_quantize(t)
+        t = torch.zeros(16)
+        qt = nvfp4_quantize(t)
         assert qt.scales[0].item() == 0.0
 
     def test_mixed_sign(self):
         t = torch.tensor([-6.0, -3.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0,
-                           6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                           0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                           0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        qt = mxfp4_quantize(t)
-        recon = mxfp4_dequantize(qt)
+                           6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        qt = nvfp4_quantize(t)
+        recon = nvfp4_dequantize(qt)
         assert (recon[:4] <= 0).all()
         assert (recon[5:9] >= 0).all()
 
 
 # ---------------------------------------------------------------------------
-# Round-trip: MXFP6
+# Round-trip: FP8
 # ---------------------------------------------------------------------------
 
-class TestMXFP6RoundTrip:
+class TestFP8RoundTrip:
     def test_basic(self):
         t = _rand_tensor(128)
-        qt = mxfp6_quantize(t)
-        recon = mxfp6_dequantize(qt)
+        qt = fp8_quantize(t)
+        recon = fp8_dequantize(qt)
         assert recon.shape == t.shape
 
     def test_zero_tensor(self):
         t = torch.zeros(64)
-        qt = mxfp6_quantize(t)
-        recon = mxfp6_dequantize(qt)
+        qt = fp8_quantize(t)
+        recon = fp8_dequantize(qt)
         assert torch.allclose(recon, t)
 
     def test_single_element(self):
         t = torch.tensor([2.5])
-        qt = mxfp6_quantize(t)
-        recon = mxfp6_dequantize(qt)
+        qt = fp8_quantize(t)
+        recon = fp8_dequantize(qt)
         assert recon.shape == t.shape
 
-    def test_large_outlier(self):
-        t = torch.zeros(32)
-        t[0] = 500.0
-        qt = mxfp6_quantize(t)
-        recon = mxfp6_dequantize(qt)
-        assert recon[0] > 0
-
-    def test_codes_in_range(self):
+    def test_per_channel_scale(self):
+        """FP8 should have a per-channel (single) FP32 scale."""
         t = _rand_tensor(128)
-        qt = mxfp6_quantize(t)
-        assert qt.data.min() >= 0
-        assert qt.data.max() <= 63
+        qt = fp8_quantize(t)
+        assert qt.scales.shape == (1,)
+        assert qt.scales.dtype == torch.float32
+
+    def test_low_error(self):
+        """FP8 should have very low MSE for standard normal data."""
+        t = _rand_tensor(1024)
+        qt = fp8_quantize(t)
+        recon = fp8_dequantize(qt)
+        mse = ((t - recon) ** 2).mean().item()
+        assert mse < 0.001, f"FP8 MSE too high: {mse}"
 
     @pytest.mark.parametrize("n", SIZES)
     def test_various_sizes(self, n):
         t = _rand_tensor(n)
-        qt = mxfp6_quantize(t)
-        recon = mxfp6_dequantize(qt)
+        qt = fp8_quantize(t)
+        recon = fp8_dequantize(qt)
         assert recon.shape == t.shape
 
     def test_format_name(self):
         t = _rand_tensor(64)
-        qt = mxfp6_quantize(t)
-        assert qt.format_name == "MXFP6"
+        qt = fp8_quantize(t)
+        assert qt.format_name == "FP8"
 
     def test_bits_per_element_field(self):
         t = _rand_tensor(64)
-        qt = mxfp6_quantize(t)
-        assert qt.bits_per_element == 6
-
-
-# ---------------------------------------------------------------------------
-# Round-trip: MXFP8
-# ---------------------------------------------------------------------------
-
-class TestMXFP8RoundTrip:
-    def test_basic(self):
-        t = _rand_tensor(128)
-        qt = mxfp8_quantize(t)
-        recon = mxfp8_dequantize(qt)
-        assert recon.shape == t.shape
-
-    def test_zero_tensor(self):
-        t = torch.zeros(64)
-        qt = mxfp8_quantize(t)
-        recon = mxfp8_dequantize(qt)
-        assert torch.allclose(recon, t)
-
-    def test_single_element(self):
-        t = torch.tensor([1.0])
-        qt = mxfp8_quantize(t)
-        recon = mxfp8_dequantize(qt)
-        assert recon.shape == t.shape
-
-    def test_codes_in_range(self):
-        t = _rand_tensor(128)
-        qt = mxfp8_quantize(t)
-        assert qt.data.min() >= 0
-        assert qt.data.max() <= 255
-
-    @pytest.mark.parametrize("n", SIZES)
-    def test_various_sizes(self, n):
-        t = _rand_tensor(n)
-        qt = mxfp8_quantize(t)
-        recon = mxfp8_dequantize(qt)
-        assert recon.shape == t.shape
-
-    def test_format_name(self):
-        t = _rand_tensor(64)
-        qt = mxfp8_quantize(t)
-        assert qt.format_name == "MXFP8"
-
-    def test_bits_per_element_field(self):
-        t = _rand_tensor(64)
-        qt = mxfp8_quantize(t)
+        qt = fp8_quantize(t)
         assert qt.bits_per_element == 8
 
 
 # ---------------------------------------------------------------------------
-# MXQuantizedTensor fields
+# Round-trip: FP16
+# ---------------------------------------------------------------------------
+
+class TestFP16RoundTrip:
+    def test_basic(self):
+        t = _rand_tensor(128)
+        qt = fp16_quantize(t)
+        recon = fp16_dequantize(qt)
+        assert recon.shape == t.shape
+
+    def test_zero_tensor(self):
+        t = torch.zeros(64)
+        qt = fp16_quantize(t)
+        recon = fp16_dequantize(qt)
+        assert torch.allclose(recon, t)
+
+    def test_nearly_lossless(self):
+        """FP16 should have near-zero MSE for normal-range data."""
+        t = _rand_tensor(1024)
+        qt = fp16_quantize(t)
+        recon = fp16_dequantize(qt)
+        mse = ((t - recon) ** 2).mean().item()
+        assert mse < 1e-6, f"FP16 MSE too high: {mse}"
+
+    def test_format_name(self):
+        t = _rand_tensor(64)
+        qt = fp16_quantize(t)
+        assert qt.format_name == "FP16"
+
+    def test_bits_per_element_field(self):
+        t = _rand_tensor(64)
+        qt = fp16_quantize(t)
+        assert qt.bits_per_element == 16
+
+
+# ---------------------------------------------------------------------------
+# QuantizedTensor fields
 # ---------------------------------------------------------------------------
 
 def test_quantized_tensor_fields():
     t = _rand_tensor(128)
     for fmt in FORMATS:
         qt = quantize(t, fmt)
-        assert isinstance(qt, MXQuantizedTensor)
+        assert isinstance(qt, QuantizedTensor)
         assert qt.format_name == fmt
         assert qt.original_shape == t.shape
         assert isinstance(qt.data, torch.Tensor)
@@ -272,23 +270,23 @@ def test_quantized_tensor_fields():
 
 
 # ---------------------------------------------------------------------------
-# MSE monotonicity: MXFP4 >= MXFP6 >= MXFP8
+# MSE monotonicity: NVFP4 >= FP8 >= FP16 ~= 0
 # ---------------------------------------------------------------------------
 
 class TestMSEMonotonicity:
     @pytest.mark.parametrize("n", [128, 1024])
     def test_monotonicity(self, n):
         t = _rand_tensor(n)
-        mse_fp4 = compute_mse(t, "MXFP4")
-        mse_fp6 = compute_mse(t, "MXFP6")
-        mse_fp8 = compute_mse(t, "MXFP8")
+        mse_nvfp4 = compute_mse(t, "NVFP4")
+        mse_fp8 = compute_mse(t, "FP8")
+        mse_fp16 = compute_mse(t, "FP16")
 
-        assert mse_fp4 >= mse_fp6, f"MXFP4 MSE ({mse_fp4}) should >= MXFP6 MSE ({mse_fp6})"
-        assert mse_fp6 >= mse_fp8, f"MXFP6 MSE ({mse_fp6}) should >= MXFP8 MSE ({mse_fp8})"
+        assert mse_nvfp4 >= mse_fp8, f"NVFP4 MSE ({mse_nvfp4}) should >= FP8 MSE ({mse_fp8})"
+        assert mse_fp8 >= mse_fp16 - 1e-12, f"FP8 MSE ({mse_fp8}) should >= FP16 MSE ({mse_fp16})"
 
-    def test_fp4_higher_error_than_fp8(self):
+    def test_nvfp4_higher_error_than_fp16(self):
         t = _rand_tensor(1024)
-        assert compute_mse(t, "MXFP4") > compute_mse(t, "MXFP8")
+        assert compute_mse(t, "NVFP4") > compute_mse(t, "FP16")
 
     def test_zero_tensor_all_zero_mse(self):
         t = torch.zeros(128)
@@ -296,11 +294,11 @@ class TestMSEMonotonicity:
             mse = compute_mse(t, fmt)
             assert mse == 0.0, f"{fmt}: expected 0 MSE for zero tensor, got {mse}"
 
-    def test_mxfp8_low_error(self):
-        """MXFP8 should have very low MSE for standard normal data."""
+    def test_fp16_near_zero_error(self):
+        """FP16 should have very low MSE for standard normal data."""
         t = _rand_tensor(1024)
-        mse = compute_mse(t, "MXFP8")
-        assert mse < 0.01, f"MXFP8 MSE too high: {mse}"
+        mse = compute_mse(t, "FP16")
+        assert mse < 1e-6, f"FP16 MSE too high: {mse}"
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +317,7 @@ def test_unified_api_roundtrip():
 def test_unified_api_invalid_format():
     t = _rand_tensor(128)
     with pytest.raises(KeyError):
-        quantize(t, "FP16")
+        quantize(t, "MXFP4")
 
 
 # ---------------------------------------------------------------------------
@@ -409,8 +407,8 @@ class TestEdgeCases:
             assert not torch.isnan(recon).any()
 
     def test_non_multiple_of_block_size(self):
-        """Tensor length not a multiple of 32."""
-        for n in [1, 7, 33, 65, 100]:
+        """Tensor length not a multiple of 16."""
+        for n in [1, 7, 17, 33, 65, 100]:
             for fmt in FORMATS:
                 t = _rand_tensor(n)
                 qt = quantize(t, fmt)
@@ -422,48 +420,41 @@ class TestEdgeCases:
 # LUT sanity checks
 # ---------------------------------------------------------------------------
 
-def test_mxfp4_lut_symmetry():
+def test_nvfp4_lut_symmetry():
     """LUT should be antisymmetric: lut[i+8] == -lut[i]."""
-    lut = _MXFP4_LUT
+    lut = _NVFP4_LUT
     for i in range(8):
         assert lut[i] == -lut[i + 8], f"LUT[{i}]={lut[i]}, LUT[{i+8}]={lut[i+8]}"
 
 
-def test_mxfp4_lut_zero_at_index_0():
-    assert _MXFP4_LUT[0].item() == 0.0
+def test_nvfp4_lut_zero_at_index_0():
+    assert _NVFP4_LUT[0].item() == 0.0
 
 
-def test_mxfp4_lut_max_value():
-    assert _MXFP4_LUT[7].item() == 6.0
+def test_nvfp4_lut_max_value():
+    assert _NVFP4_LUT[7].item() == 6.0
 
 
-def test_mxfp4_lut_size():
-    assert len(_MXFP4_LUT) == 16
-
-
-def test_mxfp6_lut_size():
-    assert len(_MXFP6_LUT) == 64
-
-
-def test_mxfp8_lut_size():
-    assert len(_MXFP8_E4M3_LUT) == 256
-
-
-def test_mxfp8_lut_no_nan():
-    assert not torch.isnan(_MXFP8_E4M3_LUT).any()
-
-
-def test_mxfp6_lut_zero_at_index_0():
-    assert _MXFP6_LUT[0].item() == 0.0
-
-
-def test_mxfp8_lut_zero_at_index_0():
-    assert _MXFP8_E4M3_LUT[0].item() == 0.0
+def test_nvfp4_lut_size():
+    assert len(_NVFP4_LUT) == 16
 
 
 # ---------------------------------------------------------------------------
 # Block size consistency
 # ---------------------------------------------------------------------------
 
-def test_block_size_is_32():
-    assert _MX_BLOCK_SIZE == 32
+def test_block_size_is_16():
+    assert _NVFP4_BLOCK_SIZE == 16
+
+
+# ---------------------------------------------------------------------------
+# FP8 E4M3 helper
+# ---------------------------------------------------------------------------
+
+def test_fp8_e4m3_clamp():
+    """Values beyond 448 should be clamped."""
+    t = torch.tensor([500.0, -500.0, 448.0, -448.0, 0.0])
+    result = _quantize_to_fp8_e4m3(t)
+    assert result[0].item() <= 448.0
+    assert result[1].item() >= -448.0
+    assert result[4].item() == 0.0

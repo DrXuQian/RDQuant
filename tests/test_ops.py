@@ -3,7 +3,7 @@ Tests for rdquant/ops.py -- mixed_precision_linear correctness.
 
 Verifies that the grouped-GEMM path (per-format dequant -> matmul -> cat ->
 inv_perm) produces the same output as the monolithic dequant -> single matmul.
-Also tests MXFP8 activation quantization path.
+No activation quantization (activations always in FP16).
 """
 
 import torch
@@ -27,10 +27,10 @@ class _TinyModel(nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
-def _quantize_tiny(budget: float = 6.0, quantize_activation: bool = True) -> tuple:
+def _quantize_tiny(budget: float = 10.0) -> tuple:
     """Return (quantized_model, fresh_input)."""
     model = _TinyModel()
-    qm = quantize_model(model, budget_avg_bits=budget, quantize_activation=quantize_activation)
+    qm = quantize_model(model, budget_avg_bits=budget)
     x = torch.randn(2, 128)
     return qm, x
 
@@ -44,10 +44,10 @@ class TestGroupedVsMonolithic:
         w = qlayer.quantized_weight.dequantize()
         return F.linear(x, w, qlayer.bias)
 
-    @pytest.mark.parametrize("budget", [4.0, 6.0, 8.0])
-    def test_outputs_match_no_act_quant(self, budget):
-        """Without act quant, grouped should match monolithic exactly."""
-        qm, _ = _quantize_tiny(budget, quantize_activation=False)
+    @pytest.mark.parametrize("budget", [4.0, 10.0, 16.0])
+    def test_outputs_match(self, budget):
+        """Grouped should match monolithic exactly."""
+        qm, _ = _quantize_tiny(budget)
         for name, mod in qm.model.named_modules():
             if not isinstance(mod, QuantizedLayer):
                 continue
@@ -78,65 +78,31 @@ class TestGroupedVsMonolithic:
 
 
 # --------------------------------------------------------------------------
-#  Activation quantization
-# --------------------------------------------------------------------------
-
-class TestActivationQuantization:
-    def test_act_quant_changes_output(self):
-        """Enabling act quant should produce different output than disabling it."""
-        model1 = _TinyModel()
-        model2 = _TinyModel()
-        # Copy weights to make them identical
-        model2.load_state_dict(model1.state_dict())
-
-        qm1 = quantize_model(model1, budget_avg_bits=6.0, quantize_activation=True)
-        qm2 = quantize_model(model2, budget_avg_bits=6.0, quantize_activation=False)
-
-        x = torch.randn(2, 128)
-        with torch.no_grad():
-            y1 = qm1(x)
-            y2 = qm2(x)
-
-        # Outputs should differ due to activation quantization
-        # (unless the effect is negligible for this random data)
-        # At least the shapes should match
-        assert y1.shape == y2.shape
-
-    def test_act_quant_output_finite(self):
-        qm, x = _quantize_tiny(quantize_activation=True)
-        with torch.no_grad():
-            y = qm(x)
-        assert torch.isfinite(y).all()
-
-
-# --------------------------------------------------------------------------
 #  Direct mixed_precision_linear API
 # --------------------------------------------------------------------------
 
 class TestDirectAPI:
     def test_with_bias(self):
-        qm, _ = _quantize_tiny(quantize_activation=False)
+        qm, _ = _quantize_tiny()
         for name, mod in qm.model.named_modules():
             if isinstance(mod, QuantizedLayer) and mod.bias is not None:
                 x_layer = torch.randn(2, mod.in_features)
                 qw = mod.quantized_weight
                 y = mixed_precision_linear(
                     x_layer, qw.qtensors, qw.splits, qw.inv_permutation, mod.bias,
-                    quantize_activation=False,
                 )
                 assert y.shape[-1] == mod.out_features
                 return
         pytest.skip("No biased layer found")
 
     def test_without_bias(self):
-        qm, _ = _quantize_tiny(quantize_activation=False)
+        qm, _ = _quantize_tiny()
         for name, mod in qm.model.named_modules():
             if isinstance(mod, QuantizedLayer) and mod.bias is None:
                 x_layer = torch.randn(2, mod.in_features)
                 qw = mod.quantized_weight
                 y = mixed_precision_linear(
                     x_layer, qw.qtensors, qw.splits, qw.inv_permutation, None,
-                    quantize_activation=False,
                 )
                 assert y.shape[-1] == mod.out_features
                 return
@@ -150,18 +116,18 @@ class TestDirectAPI:
 
 
 # --------------------------------------------------------------------------
-#  Edge: all-one-format (budget 4 -> all MXFP4, budget 8 -> all MXFP8)
+#  Edge: all-one-format (budget 4 -> all NVFP4, budget 16 -> all FP16)
 # --------------------------------------------------------------------------
 
 class TestSingleFormat:
-    def test_all_mxfp4(self):
+    def test_all_nvfp4(self):
         qm, x = _quantize_tiny(budget=4.0)
         y = qm(x)
         assert y.shape == (2, 32)
         assert torch.isfinite(y).all()
 
-    def test_all_mxfp8(self):
-        qm, x = _quantize_tiny(budget=8.0)
+    def test_all_fp16(self):
+        qm, x = _quantize_tiny(budget=16.0)
         y = qm(x)
         assert y.shape == (2, 32)
         assert torch.isfinite(y).all()

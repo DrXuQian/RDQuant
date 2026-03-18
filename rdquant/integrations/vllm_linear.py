@@ -1,14 +1,13 @@
 """
 Mixed-precision linear layer for vLLM inference.
 
-MXFP8 x MXFPx GEMM per format group:
-  y_mxfp4 = mxfp8_x_mxfp4_gemm(x_mxfp8, w_mxfp4, scales)
-  y_mxfp6 = mxfp8_x_mxfp6_gemm(x_mxfp8, w_mxfp6, scales)
-  y_mxfp8 = mxfp8_x_mxfp8_gemm(x_mxfp8, w_mxfp8, scales)
-  y = cat([y_mxfp4, y_mxfp6, y_mxfp8])[inv_perm]
+NVFP4/FP8/FP16 GEMM per format group:
+  y_nvfp4 = marlin_gemm(x_fp16, w_nvfp4, block_scales, global_scale)  # float4_e2m1f
+  y_fp8   = cutlass_scaled_mm(x_fp16, w_fp8, channel_scales)          # per-channel FP8
+  y_fp16  = F.linear(x_fp16, w_fp16)                                  # passthrough
+  y = cat([y_nvfp4, y_fp8, y_fp16])[inv_perm]
 
-Activations are quantized once to MXFP8, then each group performs
-an MXFP8 x MXFPx GEMM.
+Activations remain in FP16 (no activation quantization).
 """
 
 from __future__ import annotations
@@ -28,9 +27,9 @@ class RDQuantLinear(nn.Module):
     order via the inverse permutation.
 
     Currently falls back to fake-quantization (dequantize then FP32 GEMM)
-    because real MX GEMM kernels require custom CUDA extensions. Once
-    vLLM's MXFP8 x MXFPx grouped GEMM kernels are available this class
-    will be updated to use them.
+    because real vLLM kernels require custom CUDA extensions. Once
+    vLLM's NVFP4 marlin_gemm and FP8 cutlass_scaled_mm kernels are
+    available this class will be updated to use them.
 
     Args:
         in_features: Number of input features.
@@ -81,7 +80,10 @@ class RDQuantLinear(nn.Module):
         """Forward pass.
 
         Stub: dequantizes the weight and uses a standard FP32 GEMM.
-        In a future version this will dispatch to per-format vLLM MXFP8 x MXFPx kernels.
+        In a future version this will dispatch to per-format vLLM kernels:
+          - NVFP4: marlin_gemm with float4_e2m1f
+          - FP8: cutlass_scaled_mm with per-channel scale
+          - FP16: standard F.linear
 
         Args:
             x: Input tensor of shape ``[..., in_features]``.

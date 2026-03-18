@@ -31,8 +31,8 @@ def parse_args() -> argparse.Namespace:
         "--formats",
         type=str,
         nargs="+",
-        default=["MXFP4", "MXFP6", "MXFP8"],
-        help="Allowed quantization formats (MX-only).",
+        default=["NVFP4", "FP8", "FP16"],
+        help="Allowed quantization formats (NVFP4/FP8/FP16).",
     )
     parser.add_argument(
         "--device",

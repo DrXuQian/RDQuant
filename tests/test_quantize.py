@@ -100,7 +100,7 @@ def test_budget_approximately_met():
 
     if total_params > 0:
         actual_bits = total_bits / total_params
-        assert abs(actual_bits - target_bits) < 1.5
+        assert abs(actual_bits - target_bits) < 2.0
 
 
 def test_ignore_patterns():
@@ -181,30 +181,30 @@ def test_formats_subset():
     torch.manual_seed(9)
     model = _make_tiny()
     x = torch.randn(2, 64)
-    qmodel = quantize_model(model, budget_avg_bits=7.0, formats=["MXFP6", "MXFP8"])
+    qmodel = quantize_model(model, budget_avg_bits=10.0, formats=["FP8", "FP16"])
     with torch.no_grad():
         out = qmodel(x)
     assert torch.isfinite(out).all()
 
 
-def test_low_budget_mostly_mxfp4():
+def test_low_budget_mostly_nvfp4():
     torch.manual_seed(10)
     model = TinyModel()
     qmodel = quantize_model(model, budget_avg_bits=4.0)
     for name, result in qmodel.layer_info.items():
         total_ch = sum(result.splits.values())
-        mxfp4_ch = result.splits.get("MXFP4", 0)
-        assert mxfp4_ch >= total_ch * 0.5
+        nvfp4_ch = result.splits.get("NVFP4", 0)
+        assert nvfp4_ch >= total_ch * 0.5
 
 
-def test_high_budget_mostly_mxfp8():
+def test_high_budget_mostly_fp16():
     torch.manual_seed(11)
     model = TinyModel()
-    qmodel = quantize_model(model, budget_avg_bits=8.0)
+    qmodel = quantize_model(model, budget_avg_bits=16.0)
     for name, result in qmodel.layer_info.items():
         total_ch = sum(result.splits.values())
-        mxfp8_ch = result.splits.get("MXFP8", 0)
-        assert mxfp8_ch == total_ch
+        fp16_ch = result.splits.get("FP16", 0)
+        assert fp16_ch == total_ch
 
 
 def test_quantized_layer_repr():
@@ -213,29 +213,3 @@ def test_quantized_layer_repr():
     qmodel = quantize_model(model, budget_avg_bits=5.3)
     repr_str = repr(qmodel.model.fc1)
     assert "avg_bits" in repr_str
-    assert "act_quant" in repr_str
-
-
-def test_activation_quantization_disabled():
-    """quantize_activation=False should skip MXFP8 act quantization."""
-    torch.manual_seed(13)
-    model = _make_tiny()
-    x = torch.randn(2, 64)
-    qmodel = quantize_model(model, budget_avg_bits=5.3, quantize_activation=False)
-    with torch.no_grad():
-        out = qmodel(x)
-    assert torch.isfinite(out).all()
-    # Check that QuantizedLayer has act quant disabled
-    for name, mod in qmodel.model.named_modules():
-        if isinstance(mod, QuantizedLayer):
-            assert not mod.quantize_activation
-
-
-def test_activation_quantization_enabled_by_default():
-    """By default, activation quantization should be enabled."""
-    torch.manual_seed(14)
-    model = _make_tiny()
-    qmodel = quantize_model(model, budget_avg_bits=5.3)
-    for name, mod in qmodel.model.named_modules():
-        if isinstance(mod, QuantizedLayer):
-            assert mod.quantize_activation

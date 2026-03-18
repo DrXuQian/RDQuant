@@ -32,7 +32,7 @@ from rdquant.core.sensitivity import compute_rd_points
 from rdquant.core.formats import get_bits_per_element
 
 # Canonical format order: lowest bits first
-_FORMAT_ORDER = ["MXFP4", "MXFP6", "MXFP8"]
+_FORMAT_ORDER = ["NVFP4", "FP8", "FP16"]
 
 # Group alignment: each format group must be a multiple of this many channels
 _GROUP_ALIGNMENT = 128
@@ -273,8 +273,8 @@ def allocate(
     """Find format assignment minimising total distortion subject to a bit budget.
 
     Uses a Lagrangian lambda-sweep with binary search:
-      - lambda=0  -> all channels pick MXFP8 (max bits, min distortion)
-      - lambda=inf -> all channels pick MXFP4 (min bits, max distortion)
+      - lambda=0  -> all channels pick FP16 (max bits, min distortion)
+      - lambda=inf -> all channels pick NVFP4 (min bits, max distortion)
       - Binary search finds lambda* where total_bits ~ budget
 
     After allocation, format groups are aligned to multiples of 128 channels
@@ -283,7 +283,7 @@ def allocate(
     Args:
         rd_table: Output of :func:`~rdquant.core.sensitivity.compute_rd_points`.
         budget_avg_bits: Target average bits per element (e.g. 5.3).
-        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
+        formats: Allowed format names. Defaults to ["NVFP4","FP8","FP16"].
         n_elements_per_channel: Number of elements per channel (N_in). Inferred
             from rd_table cost entries if not provided.
         align_groups: Whether to align format groups to multiples of 128 channels.
@@ -293,7 +293,7 @@ def allocate(
         :class:`AllocationResult` with per-channel assignments and statistics.
     """
     if formats is None:
-        formats = ["MXFP4", "MXFP6", "MXFP8"]
+        formats = ["NVFP4", "FP8", "FP16"]
 
     n_out = len(rd_table)
     if n_out == 0:
@@ -370,7 +370,7 @@ def allocate_layer(
     Args:
         weight: Float tensor of shape [N_out, N_in].
         budget_avg_bits: Target average bits per element.
-        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
+        formats: Allowed format names. Defaults to ["NVFP4","FP8","FP16"].
         sensitivity_metric: Unused (allocation uses MSE directly via rd_table).
         align_groups: Whether to align format groups to multiples of 128 channels.
 
@@ -378,7 +378,7 @@ def allocate_layer(
         :class:`AllocationResult` for this layer.
     """
     if formats is None:
-        formats = ["MXFP4", "MXFP6", "MXFP8"]
+        formats = ["NVFP4", "FP8", "FP16"]
     with torch.inference_mode():
         rd_table = compute_rd_points(weight, formats)
     return allocate(rd_table, budget_avg_bits, formats, weight.shape[1], align_groups=align_groups)
@@ -395,14 +395,14 @@ def sweep_budgets(
     Args:
         weight: Float tensor of shape [N_out, N_in].
         budgets: List of target average bits per element (e.g. [4, 5, 6, 7, 8]).
-        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
+        formats: Allowed format names. Defaults to ["NVFP4","FP8","FP16"].
         align_groups: Whether to align format groups to multiples of 128 channels.
 
     Returns:
         List of :class:`AllocationResult`, one per budget entry.
     """
     if formats is None:
-        formats = ["MXFP4", "MXFP6", "MXFP8"]
+        formats = ["NVFP4", "FP8", "FP16"]
     with torch.inference_mode():
         rd_table = compute_rd_points(weight, formats)
     n_in = weight.shape[1]

@@ -6,10 +6,11 @@ Execution backends:
   - ``pytorch``:  Pure PyTorch.  Dequant each format group -> ``F.linear`` ->
     concat -> inv-permute.  Correct on any device, used for validation.
 
-  - ``vllm`` (future):  Drop-in replacement using vLLM's native
-    Tensor-Core kernels on Blackwell:
-        MXFP8 x MXFPx GEMM per group
-        Activations quantized to MXFP8 before each GEMM
+  - ``vllm`` (future):  Drop-in replacement using vLLM's native kernels:
+        NVFP4 group: marlin_gemm with float4_e2m1f
+        FP8 group: cutlass_scaled_mm with per-channel scale
+        FP16 group: standard F.linear
+    Activations always remain in FP16 (no activation quantization).
 
 All backends produce identical results (up to floating-point ordering).
 """
@@ -21,8 +22,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from rdquant.core.formats import dequantize, MXQuantizedTensor
-from rdquant.core.act_quant import quantize_activation_mxfp8, dequantize_activation_mxfp8
+from rdquant.core.formats import dequantize, QuantizedTensor
 
 
 # --------------------------------------------------------------------------
@@ -31,39 +31,27 @@ from rdquant.core.act_quant import quantize_activation_mxfp8, dequantize_activat
 
 def mixed_precision_linear(
     x: torch.Tensor,
-    qtensors: dict[str, MXQuantizedTensor],
+    qtensors: dict[str, QuantizedTensor],
     splits: dict[str, int],
     inv_perm: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    quantize_activation: bool = True,
 ) -> torch.Tensor:
     """Mixed-precision linear: per-format dequant -> GEMM -> concat -> permute.
 
-    Optionally applies MXFP8 activation quantization before the GEMMs.
+    Activations remain in FP16 (no activation quantization).
 
     Args:
         x: Input activations ``[..., in_features]``.
-        qtensors: Format-name -> MXQuantizedTensor for each group's weights,
+        qtensors: Format-name -> QuantizedTensor for each group's weights,
             stored as ``[n_channels, in_features]`` (via ``original_shape``).
         splits: Format-name -> number of output channels in that group.
         inv_perm: ``[out_features]`` inverse-permutation to restore original
             channel order after concatenation.
         bias: Optional bias ``[out_features]`` in original channel order.
-        quantize_activation: If True, apply MXFP8 quantize->dequantize on
-            activations before the GEMMs. Default True.
 
     Returns:
         ``[..., out_features]`` output tensor.
     """
-    if quantize_activation:
-        # Straight-through estimator: quantize-dequantize the activation values
-        # but allow gradients to flow through unchanged.
-        with torch.no_grad():
-            x_codes, x_scales = quantize_activation_mxfp8(x)
-            x_hat = dequantize_activation_mxfp8(x_codes, x_scales, x.shape).to(x.dtype)
-        # Straight-through: forward uses quantized values, backward passes gradient through
-        x = x + (x_hat - x).detach()
-
     parts: list[torch.Tensor] = []
 
     for fmt, qt in qtensors.items():
@@ -94,21 +82,21 @@ def mixed_precision_linear(
 
 def mixed_precision_linear_vllm(
     x: torch.Tensor,
-    qtensors: dict[str, MXQuantizedTensor],
+    qtensors: dict[str, QuantizedTensor],
     splits: dict[str, int],
     inv_perm: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    quantize_activation: bool = True,
 ) -> torch.Tensor:
     """Same interface as :func:`mixed_precision_linear`, but uses vLLM's
     native CUDA kernels.  Requires Blackwell GPU + vLLM installed.
 
     Kernel mapping::
 
-        MXFP8 activation quantization applied once
-        MXFP8 x MXFPx GEMM per format group
+        NVFP4 group: marlin_gemm with float4_e2m1f
+        FP8 group: cutlass_scaled_mm with per-channel scale
+        FP16 group: standard F.linear
 
     Falls back to :func:`mixed_precision_linear` if vLLM is not available.
     """
     # TODO: implement when vLLM kernels are available
-    return mixed_precision_linear(x, qtensors, splits, inv_perm, bias, quantize_activation)
+    return mixed_precision_linear(x, qtensors, splits, inv_perm, bias)

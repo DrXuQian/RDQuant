@@ -37,16 +37,13 @@ class TestLayerImportance:
 
         # fc1 is very important, fc2 is not
         importance = {"fc1": 10.0, "fc2": 0.1}
-        qm = quantize_model(m1, budget_avg_bits=5.0, layer_importance=importance,
-                             quantize_activation=False)
+        qm = quantize_model(m1, budget_avg_bits=5.0, layer_importance=importance)
 
-        # Without importance — uniform allocation
-        qm_uni = quantize_model(m2, budget_avg_bits=5.0,
-                                quantize_activation=False)
+        # Without importance -- uniform allocation
+        qm_uni = quantize_model(m2, budget_avg_bits=5.0)
 
         # fc1 should get more bits with importance than without
         bits_fc1_imp = qm.layer_info["fc1"].avg_bits
-        bits_fc1_uni = qm_uni.layer_info["fc1"].avg_bits
         bits_fc2_imp = qm.layer_info["fc2"].avg_bits
 
         assert bits_fc1_imp >= bits_fc2_imp, (
@@ -60,10 +57,8 @@ class TestLayerImportance:
         m2 = _TinyModel()
         m2.load_state_dict(m1.state_dict())
 
-        qm1 = quantize_model(m1, budget_avg_bits=6.0, layer_importance=None,
-                              quantize_activation=False)
-        qm2 = quantize_model(m2, budget_avg_bits=6.0,
-                              quantize_activation=False)
+        qm1 = quantize_model(m1, budget_avg_bits=10.0, layer_importance=None)
+        qm2 = quantize_model(m2, budget_avg_bits=10.0)
 
         for name in qm1.layer_info:
             assert qm1.layer_info[name].avg_bits == qm2.layer_info[name].avg_bits
@@ -75,10 +70,8 @@ class TestLayerImportance:
         m2.load_state_dict(m1.state_dict())
 
         importance = {"fc1": 1.0, "fc2": 1.0}
-        qm1 = quantize_model(m1, budget_avg_bits=5.0, layer_importance=importance,
-                              quantize_activation=False)
-        qm2 = quantize_model(m2, budget_avg_bits=5.0,
-                              quantize_activation=False)
+        qm1 = quantize_model(m1, budget_avg_bits=5.0, layer_importance=importance)
+        qm2 = quantize_model(m2, budget_avg_bits=5.0)
 
         for name in qm1.layer_info:
             assert qm1.layer_info[name].avg_bits == qm2.layer_info[name].avg_bits
@@ -86,8 +79,7 @@ class TestLayerImportance:
     def test_output_shape_preserved(self):
         m = _TinyModel()
         importance = {"fc1": 2.0, "fc2": 0.5}
-        qm = quantize_model(m, budget_avg_bits=5.0, layer_importance=importance,
-                             quantize_activation=False)
+        qm = quantize_model(m, budget_avg_bits=5.0, layer_importance=importance)
         x = torch.randn(2, 64)
         y = qm(x)
         assert y.shape == (2, 16)
@@ -97,8 +89,7 @@ class TestLayerImportance:
         """If a layer is not in importance dict, it should default to 1.0."""
         m = _TinyModel()
         importance = {"fc1": 5.0}  # fc2 not listed
-        qm = quantize_model(m, budget_avg_bits=5.0, layer_importance=importance,
-                             quantize_activation=False)
+        qm = quantize_model(m, budget_avg_bits=5.0, layer_importance=importance)
         assert "fc1" in qm.layer_info
         assert "fc2" in qm.layer_info
 
@@ -106,11 +97,10 @@ class TestLayerImportance:
         """Very high importance on all layers should still respect budget."""
         m = _TinyModel()
         importance = {"fc1": 100.0, "fc2": 100.0}
-        qm = quantize_model(m, budget_avg_bits=5.0, layer_importance=importance,
-                             quantize_activation=False)
+        qm = quantize_model(m, budget_avg_bits=5.0, layer_importance=importance)
         actual = sum(r.avg_bits for r in qm.layer_info.values()) / len(qm.layer_info)
         # Budget should still be approximately met
-        assert actual <= 8.5  # within feasible range
+        assert actual <= 16.5  # within feasible range
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 Benchmark mixed-precision linear ops on GPU.
 
 Measures per-group GEMM latency and compares against uniform baselines.
-Uses MX-only format groups: MXFP4/MXFP6/MXFP8.
+Uses NVFP4/FP8/FP16 format groups.
 
 Usage:
     python benchmarks/bench_ops.py [--n_out 2560] [--n_in 9728] [--batch 1]
@@ -55,35 +55,35 @@ def main():
 
     x = torch.randn(B, S, n_in, device=DEVICE, dtype=dtype)
 
-    # Simulate a 40/30/30 format split (MXFP4/MXFP6/MXFP8)
-    n_mxfp4 = int(n_out * 0.40)
-    n_mxfp6 = int(n_out * 0.30)
-    n_mxfp8 = n_out - n_mxfp4 - n_mxfp6
+    # Simulate a 40/30/30 format split (NVFP4/FP8/FP16)
+    n_nvfp4 = int(n_out * 0.40)
+    n_fp8 = int(n_out * 0.30)
+    n_fp16 = n_out - n_nvfp4 - n_fp8
 
-    w_mxfp4 = torch.randn(n_mxfp4, n_in, device=DEVICE, dtype=dtype)
-    w_mxfp6 = torch.randn(n_mxfp6, n_in, device=DEVICE, dtype=dtype)
-    w_mxfp8 = torch.randn(n_mxfp8, n_in, device=DEVICE, dtype=dtype)
+    w_nvfp4 = torch.randn(n_nvfp4, n_in, device=DEVICE, dtype=dtype)
+    w_fp8 = torch.randn(n_fp8, n_in, device=DEVICE, dtype=dtype)
+    w_fp16 = torch.randn(n_fp16, n_in, device=DEVICE, dtype=dtype)
     w_full = torch.randn(n_out, n_in, device=DEVICE, dtype=dtype)
     inv_perm = torch.randperm(n_out, device=DEVICE)
 
     # Individual GEMMs
-    t_mxfp4 = bench(F.linear, x, w_mxfp4)
-    t_mxfp6 = bench(F.linear, x, w_mxfp6)
-    t_mxfp8 = bench(F.linear, x, w_mxfp8)
+    t_nvfp4 = bench(F.linear, x, w_nvfp4)
+    t_fp8 = bench(F.linear, x, w_fp8)
+    t_fp16 = bench(F.linear, x, w_fp16)
 
     # Cat + permute
-    y_mxfp4 = F.linear(x, w_mxfp4)
-    y_mxfp6 = F.linear(x, w_mxfp6)
-    y_mxfp8_ = F.linear(x, w_mxfp8)
-    t_cat = bench(torch.cat, [y_mxfp4, y_mxfp6, y_mxfp8_], dim=-1)
-    y_cat = torch.cat([y_mxfp4, y_mxfp6, y_mxfp8_], dim=-1)
+    y_nvfp4 = F.linear(x, w_nvfp4)
+    y_fp8 = F.linear(x, w_fp8)
+    y_fp16_ = F.linear(x, w_fp16)
+    t_cat = bench(torch.cat, [y_nvfp4, y_fp8, y_fp16_], dim=-1)
+    y_cat = torch.cat([y_nvfp4, y_fp8, y_fp16_], dim=-1)
     t_perm = bench(lambda: y_cat.index_select(-1, inv_perm))
 
     # Full mixed path
     def mixed_path():
-        a = F.linear(x, w_mxfp4)
-        b = F.linear(x, w_mxfp6)
-        c = F.linear(x, w_mxfp8)
+        a = F.linear(x, w_nvfp4)
+        b = F.linear(x, w_fp8)
+        c = F.linear(x, w_fp16)
         y = torch.cat([a, b, c], dim=-1)
         return y.index_select(-1, inv_perm)
 
@@ -92,13 +92,13 @@ def main():
     # Uniform baseline
     t_uniform = bench(F.linear, x, w_full)
 
-    total_parts = t_mxfp4 + t_mxfp6 + t_mxfp8 + t_cat + t_perm
+    total_parts = t_nvfp4 + t_fp8 + t_fp16 + t_cat + t_perm
 
     print(f"{'Operation':<25} {'Latency (us)':>12}  {'% of total':>10}")
     print("-" * 52)
-    print(f"{'MXFP4 group GEMM':<25} {t_mxfp4:>12.1f}  {t_mxfp4/total_parts*100:>9.1f}%")
-    print(f"{'MXFP6 group GEMM':<25} {t_mxfp6:>12.1f}  {t_mxfp6/total_parts*100:>9.1f}%")
-    print(f"{'MXFP8 group GEMM':<25} {t_mxfp8:>12.1f}  {t_mxfp8/total_parts*100:>9.1f}%")
+    print(f"{'NVFP4 group GEMM':<25} {t_nvfp4:>12.1f}  {t_nvfp4/total_parts*100:>9.1f}%")
+    print(f"{'FP8 group GEMM':<25} {t_fp8:>12.1f}  {t_fp8/total_parts*100:>9.1f}%")
+    print(f"{'FP16 group GEMM':<25} {t_fp16:>12.1f}  {t_fp16/total_parts*100:>9.1f}%")
     print(f"{'cat':<25} {t_cat:>12.1f}  {t_cat/total_parts*100:>9.1f}%")
     print(f"{'inv_perm':<25} {t_perm:>12.1f}  {t_perm/total_parts*100:>9.1f}%")
     print("-" * 52)

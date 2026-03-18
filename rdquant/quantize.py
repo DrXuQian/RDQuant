@@ -3,8 +3,8 @@ End-to-end mixed-precision quantization for HuggingFace (and generic nn.Module) 
 
 Implements quantize_model(), QuantizedWeight, QuantizedLayer, and QuantizedModel.
 
-All weight formats are MX-only (MXFP4, MXFP6, MXFP8) with optional MXFP8
-activation quantization applied uniformly before each GEMM.
+Weight formats: NVFP4, FP8, FP16. Activations always remain in FP16 (no activation
+quantization).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from rdquant.core.formats import quantize, dequantize, get_bits_per_element, MXQuantizedTensor
+from rdquant.core.formats import quantize, dequantize, get_bits_per_element, QuantizedTensor
 from rdquant.core.allocator import allocate_layer, allocate, AllocationResult
 from rdquant.core.sensitivity import compute_rd_points
 
@@ -32,7 +32,7 @@ class QuantizedWeight:
     """Packed quantized weight data for a single linear layer.
 
     Attributes:
-        qtensors: Dict mapping format_name -> MXQuantizedTensor (for the group of
+        qtensors: Dict mapping format_name -> QuantizedTensor (for the group of
             channels assigned to that format).
         permutation: [N_out] index tensor that reorders channels by format.
         inv_permutation: [N_out] inverse permutation to restore original order.
@@ -40,7 +40,7 @@ class QuantizedWeight:
         original_shape: (N_out, N_in) shape of the original weight.
         avg_bits: Average bits per element achieved.
     """
-    qtensors: dict[str, MXQuantizedTensor]
+    qtensors: dict[str, QuantizedTensor]
     permutation: torch.Tensor
     inv_permutation: torch.Tensor
     splits: dict[str, int]
@@ -78,14 +78,13 @@ class QuantizedLayer(nn.Module):
 
     Stores a QuantizedWeight and reconstructs the full weight on each forward
     pass using dequantize + inv_permutation before running the standard linear.
-    Optionally applies MXFP8 activation quantization.
+    Activations remain in FP16 (no activation quantization).
 
     Args:
         quantized_weight: The quantized weight data.
         bias: Optional bias tensor (copied from original layer if present).
         in_features: Number of input features.
         out_features: Number of output features.
-        quantize_activation: Whether to apply MXFP8 activation quantization.
     """
 
     def __init__(
@@ -94,20 +93,18 @@ class QuantizedLayer(nn.Module):
         bias: Optional[torch.Tensor],
         in_features: int,
         out_features: int,
-        quantize_activation: bool = True,
     ) -> None:
         super().__init__()
         self.quantized_weight = quantized_weight
         self.in_features = in_features
         self.out_features = out_features
-        self.quantize_activation = quantize_activation
         if bias is not None:
             self.bias = nn.Parameter(bias.clone())
         else:
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Mixed-precision forward: optional act quant -> per-format dequant -> GEMM -> concat -> permute.
+        """Mixed-precision forward: per-format dequant -> GEMM -> concat -> permute.
 
         Args:
             x: Input tensor of shape [..., in_features].
@@ -120,14 +117,12 @@ class QuantizedLayer(nn.Module):
         qw = self.quantized_weight
         return mixed_precision_linear(
             x, qw.qtensors, qw.splits, qw.inv_permutation, self.bias,
-            quantize_activation=self.quantize_activation,
         )
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"avg_bits={self.quantized_weight.avg_bits:.2f}, "
-            f"act_quant={'MXFP8' if self.quantize_activation else 'none'}"
+            f"avg_bits={self.quantized_weight.avg_bits:.2f}"
         )
 
 
@@ -244,7 +239,7 @@ def _quantize_weight(
     # Reorder channels by format group
     weight_perm = weight[perm]  # [N_out, N_in] in format-grouped order
 
-    qtensors: dict[str, MXQuantizedTensor] = {}
+    qtensors: dict[str, QuantizedTensor] = {}
     offset = 0
     for fmt in result.splits:
         n_ch = result.splits[fmt]
@@ -254,12 +249,13 @@ def _quantize_weight(
         flat = group.flatten().float()
         qt = quantize(flat, fmt)
         # Override original_shape to [n_ch, n_in] so dequantize restores 2-D
-        qt = MXQuantizedTensor(
+        qt = QuantizedTensor(
             data=qt.data,
             scales=qt.scales,
             format_name=qt.format_name,
             original_shape=torch.Size([n_ch, n_in]),
             bits_per_element=qt.bits_per_element,
+            global_scale=qt.global_scale,
         )
         qtensors[fmt] = qt
         offset += n_ch
@@ -313,7 +309,6 @@ def quantize_model(
     sensitivity_metric: str = "mse",
     ignore: list[str] = None,
     per_layer_budget: bool = False,
-    quantize_activation: bool = True,
     layer_importance: dict[str, float] | None = None,
 ) -> QuantizedModel:
     """Quantize all nn.Linear layers of a model using R-D optimal allocation.
@@ -321,24 +316,22 @@ def quantize_model(
     Args:
         model: Any nn.Module (HuggingFace PreTrainedModel or custom).
         budget_avg_bits: Target average bits per element across all (or per) layers.
-        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
+        formats: Allowed format names. Defaults to ["NVFP4","FP8","FP16"].
         sensitivity_metric: Sensitivity metric passed to allocate_layer().
         ignore: List of layer name patterns (fnmatch-style) to skip quantization.
         per_layer_budget: If True, apply budget independently to each layer.
             If False (default), do a global lambda sweep across all layers for
             better cross-layer bit allocation.
-        quantize_activation: If True, apply MXFP8 activation quantization in
-            each QuantizedLayer forward pass. Default True.
         layer_importance: Optional dict mapping layer name to importance weight
             (from :func:`~rdquant.core.calibrate.compute_layer_importance`).
-            Higher weight → layer gets more bits.  Requires calibration data.
+            Higher weight -> layer gets more bits.  Requires calibration data.
             When None (default), all layers are treated equally (data-free mode).
 
     Returns:
         QuantizedModel wrapping the modified model.
     """
     if formats is None:
-        formats = ["MXFP4", "MXFP6", "MXFP8"]
+        formats = ["NVFP4", "FP8", "FP16"]
 
     if ignore is None:
         ignore = []
@@ -444,7 +437,6 @@ def quantize_model(
                 bias=bias,
                 in_features=layer.in_features,
                 out_features=layer.out_features,
-                quantize_activation=quantize_activation,
             )
             _set_module(model, name, qlayer)
 

@@ -7,7 +7,7 @@ a sensitivity score per output channel of shape [N_out].
 Higher sensitivity = channel is harder to quantize = needs more bits.
 
 Available metrics:
-  - "mse": Direct quantization MSE at the lowest format (MXFP4).
+  - "mse": Direct quantization MSE at the lowest format (NVFP4).
            Most accurate, slightly slower.
   - "weighted_mse": MSE x ||W_j||^2. Accounts for weight magnitude.
   - "max_over_std": max(|W_j|) / std(W_j). Measures outlier severity.
@@ -79,7 +79,7 @@ _METRIC_FNS = {
 def compute_sensitivity(
     weight: torch.Tensor,
     metric: str = "mse",
-    base_format: str = "MXFP4",
+    base_format: str = "NVFP4",
 ) -> torch.Tensor:
     """Compute per-channel sensitivity scores for a weight matrix.
 
@@ -87,7 +87,7 @@ def compute_sensitivity(
         weight: Float tensor of shape [N_out, N_in].
         metric: One of "mse", "weighted_mse", "max_over_std", "kurtosis",
             "range_ratio".
-        base_format: Format used for MSE-based metrics (default "MXFP4").
+        base_format: Format used for MSE-based metrics (default "NVFP4").
 
     Returns:
         Float32 tensor of shape [N_out] with per-channel sensitivity scores.
@@ -101,7 +101,7 @@ def compute_sensitivity(
 @torch.inference_mode()
 def compute_rd_points(
     weight: torch.Tensor,
-    formats: list[str] = ["MXFP4", "MXFP6", "MXFP8"],
+    formats: list[str] = ["NVFP4", "FP8", "FP16"],
 ) -> dict:
     """Compute (rate, distortion) pairs for every channel x format combination.
 

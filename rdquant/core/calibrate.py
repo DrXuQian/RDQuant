@@ -6,7 +6,7 @@ compute per-layer importance weights.  These weights rescale distortion
 in the R-D allocator so that sensitive layers receive more bits.
 
 Supported importance metrics:
-  - "perturb":   Delta-loss when each layer is quantized to MXFP4 while others
+  - "perturb":   Delta-loss when each layer is quantized to NVFP4 while others
                  stay BF16.  Most accurate, but O(n_layers) forward passes.
   - "fisher":    ||dL/dW||_F^2  (requires backward pass)
   - "act_norm":  ||X||_F^2 averaged over calibration tokens
@@ -113,11 +113,11 @@ def _compute_perturb_importance(
     target_layers: dict[str, nn.Linear],
     tokens_list: list[torch.Tensor],
 ) -> dict[str, float]:
-    """Compute importance = delta-loss when each layer is quantized to MXFP4.
+    """Compute importance = delta-loss when each layer is quantized to NVFP4.
 
     For each layer:
       1. Save original weight
-      2. Replace with MXFP4 quantize→dequantize reconstruction
+      2. Replace with NVFP4 quantize→dequantize reconstruction
       3. Measure average loss across calibration tokens
       4. Restore original weight
 
@@ -135,10 +135,10 @@ def _compute_perturb_importance(
         # Save original weight
         orig_weight = mod.weight.data.clone()
 
-        # Quantize weight to MXFP4 and dequantize
+        # Quantize weight to NVFP4 and dequantize
         with torch.no_grad():
             flat = orig_weight.flatten().float()
-            qt = quantize(flat, "MXFP4")
+            qt = quantize(flat, "NVFP4")
             recon = dequantize(qt).reshape(orig_weight.shape).to(orig_weight.dtype)
             mod.weight.data.copy_(recon)
 
