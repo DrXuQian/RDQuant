@@ -54,13 +54,20 @@ class AllocationResult:
     format_stats: dict[str, dict] = field(default_factory=dict)
 
 
-def _pick_formats(rd_table: dict, lam: float, formats: list[str]) -> dict[int, str]:
-    """For each channel, pick the format that minimises D_j(f) + lambda*C_j(f).
+def _pick_formats(
+    rd_table: dict,
+    lam: float,
+    formats: list[str],
+    dist_weight: float = 1.0,
+) -> dict[int, str]:
+    """For each channel, pick the format that minimises w*D_j(f) + lambda*C_j(f).
 
     Args:
         rd_table: Output of compute_rd_points().
         lam: Lagrange multiplier (non-negative).
         formats: Allowed format names.
+        dist_weight: Scalar multiplier on distortion for this layer.
+            Higher weight makes the layer prefer higher-precision formats.
 
     Returns:
         Dict mapping channel_idx -> chosen format name.
@@ -73,7 +80,7 @@ def _pick_formats(rd_table: dict, lam: float, formats: list[str]) -> dict[int, s
         for e in entries:
             if e["format"] not in format_set:
                 continue
-            lagrangian = e["distortion"] + lam * e["cost"]
+            lagrangian = dist_weight * e["distortion"] + lam * e["cost"]
             if lagrangian < best_cost:
                 best_cost = lagrangian
                 best_fmt = e["format"]
@@ -92,13 +99,17 @@ def _total_bits(rd_table: dict, assignments: dict[int, str]) -> float:
     return total
 
 
-def _total_distortion(rd_table: dict, assignments: dict[int, str]) -> float:
-    """Sum of distortions across all channels under the given assignment."""
+def _total_distortion(
+    rd_table: dict,
+    assignments: dict[int, str],
+    dist_weight: float = 1.0,
+) -> float:
+    """Weighted sum of distortions across all channels under the given assignment."""
     total = 0.0
     for j, fmt in assignments.items():
         for e in rd_table[j]:
             if e["format"] == fmt:
-                total += e["distortion"]
+                total += dist_weight * e["distortion"]
                 break
     return total
 

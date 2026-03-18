@@ -314,6 +314,7 @@ def quantize_model(
     ignore: list[str] = None,
     per_layer_budget: bool = False,
     quantize_activation: bool = True,
+    layer_importance: dict[str, float] | None = None,
 ) -> QuantizedModel:
     """Quantize all nn.Linear layers of a model using R-D optimal allocation.
 
@@ -328,6 +329,10 @@ def quantize_model(
             better cross-layer bit allocation.
         quantize_activation: If True, apply MXFP8 activation quantization in
             each QuantizedLayer forward pass. Default True.
+        layer_importance: Optional dict mapping layer name to importance weight
+            (from :func:`~rdquant.core.calibrate.compute_layer_importance`).
+            Higher weight → layer gets more bits.  Requires calibration data.
+            When None (default), all layers are treated equally (data-free mode).
 
     Returns:
         QuantizedModel wrapping the modified model.
@@ -377,13 +382,20 @@ def quantize_model(
         )
         budget_total_bits = budget_avg_bits * total_params
 
+        # Per-layer distortion weights from calibration (default: 1.0 = data-free)
+        layer_weights: dict[str, float] = {}
+        for name, _ in to_quantize:
+            layer_weights[name] = (
+                layer_importance.get(name, 1.0) if layer_importance else 1.0
+            )
+
         # Binary search for global lambda
         from rdquant.core.allocator import _pick_formats, _total_bits
 
         def _global_bits(lam: float) -> float:
             total = 0.0
             for name, rd in all_rd_tables.items():
-                assignments = _pick_formats(rd, lam, formats)
+                assignments = _pick_formats(rd, lam, formats, layer_weights[name])
                 total += _total_bits(rd, assignments)
             return total
 
@@ -414,7 +426,8 @@ def quantize_model(
         for name, layer in to_quantize:
             rd = all_rd_tables[name]
             n_in = all_n_in[name]
-            assignments = _pick_formats(rd, lambda_star, formats)
+            w = layer_weights[name]
+            assignments = _pick_formats(rd, lambda_star, formats, w)
             assignments = _align_groups(assignments, rd, formats)
             result = _build_result(rd, assignments, n_in, lambda_star, formats)
             layer_info[name] = result
