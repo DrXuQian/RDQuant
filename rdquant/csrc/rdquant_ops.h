@@ -55,3 +55,18 @@ void quantize_act_mxfp8(
     void *scales,
     int M, int K
 );
+
+// cuBLASLt MX block-scaled GEMMs (row-major scales, auto kernel selection)
+// Scales are in row-major [dim0, K/32] UE8M0 — NOT CUTLASS interleaved layout
+
+void cublas_mxfp8_gemm(   // MXFP8 act × MXFP8 weight
+    const void *A, const void *A_sf, const void *B, const void *B_sf,
+    int M, int N, int K, void *C);
+
+void cublas_mx_gemm_w4a8( // MXFP8 act × MXFP4 weight
+    const void *A, const void *A_sf, const void *B, const void *B_sf,
+    int M, int N, int K, void *C);
+
+void cublas_mx_gemm_w6a8( // MXFP8 act × MXFP6 weight
+    const void *A, const void *A_sf, const void *B, const void *B_sf,
+    int M, int N, int K, void *C);

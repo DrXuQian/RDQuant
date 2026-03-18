@@ -130,6 +130,27 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_act_mxfp8_torch(
 }
 
 // ============================================================================
+// Torch wrappers: cuBLASLt MX block-scaled GEMMs
+// ============================================================================
+#define DEFINE_CUBLAS_MX_WRAPPER(name, c_func)                                \
+torch::Tensor name(                                                           \
+    const torch::Tensor &x_fp8, const torch::Tensor &x_sf,                   \
+    const torch::Tensor &w, const torch::Tensor &w_sf,                        \
+    int M, int N, int K)                                                      \
+{                                                                             \
+    auto D = torch::empty({M, N},                                             \
+        torch::dtype(torch::kBFloat16).device(x_fp8.device()));               \
+    c_func(x_fp8.data_ptr<uint8_t>(), x_sf.data_ptr<uint8_t>(),              \
+           w.data_ptr<uint8_t>(), w_sf.data_ptr<uint8_t>(),                   \
+           M, N, K, D.data_ptr<at::BFloat16>());                              \
+    return D;                                                                 \
+}
+
+DEFINE_CUBLAS_MX_WRAPPER(cublas_mxfp8_gemm_torch,  cublas_mxfp8_gemm)
+DEFINE_CUBLAS_MX_WRAPPER(cublas_mx_w4a8_torch,     cublas_mx_gemm_w4a8)
+DEFINE_CUBLAS_MX_WRAPPER(cublas_mx_w6a8_torch,     cublas_mx_gemm_w6a8)
+
+// ============================================================================
 // PyBind11 module definition
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -168,4 +189,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Args: x_bf16[M, K]\n"
           "Returns: (x_fp8[M,K], x_sf[M,K/32]) as uint8 tensors",
           py::arg("x_bf16"));
+
+    m.def("cublas_mxfp8_gemm", &cublas_mxfp8_gemm_torch,
+          "cuBLASLt MXFP8×MXFP8 GEMM", py::arg("x_fp8"), py::arg("x_sf"),
+          py::arg("w"), py::arg("w_sf"), py::arg("M"), py::arg("N"), py::arg("K"));
+
+    m.def("cublas_mx_w4a8", &cublas_mx_w4a8_torch,
+          "cuBLASLt MXFP8×MXFP4 GEMM", py::arg("x_fp8"), py::arg("x_sf"),
+          py::arg("w"), py::arg("w_sf"), py::arg("M"), py::arg("N"), py::arg("K"));
+
+    m.def("cublas_mx_w6a8", &cublas_mx_w6a8_torch,
+          "cuBLASLt MXFP8×MXFP6 GEMM", py::arg("x_fp8"), py::arg("x_sf"),
+          py::arg("w"), py::arg("w_sf"), py::arg("M"), py::arg("N"), py::arg("K"));
 }

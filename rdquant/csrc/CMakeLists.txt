@@ -38,6 +38,7 @@ add_library(rdquant_cuda MODULE
     w6a8.cu
     w8a8.cu
     sf_layout.cu
+    cublas_mxfp8.cu
 )
 
 target_include_directories(rdquant_cuda PRIVATE
@@ -57,6 +58,7 @@ target_link_libraries(rdquant_cuda PRIVATE
     ${TORCH_LIBRARIES}
     ${TORCH_LIB_DIR}/libtorch_python.so
     Python3::Python
+    CUDA::cublasLt
 )
 
 # CUDA compile options
