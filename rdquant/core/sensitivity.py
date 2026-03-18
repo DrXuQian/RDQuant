@@ -21,16 +21,12 @@ from __future__ import annotations
 
 import torch
 
-from rdquant.core.formats import compute_mse, get_bits_per_element
+from rdquant.core.formats import compute_mse, compute_mse_2d, get_bits_per_element
 
 
 def _sensitivity_mse(weight: torch.Tensor, base_format: str) -> torch.Tensor:
     """Per-channel quantization MSE at base_format."""
-    n_out = weight.shape[0]
-    scores = torch.empty(n_out, dtype=torch.float32)
-    for j in range(n_out):
-        scores[j] = compute_mse(weight[j], base_format)
-    return scores
+    return compute_mse_2d(weight, base_format)
 
 
 def _sensitivity_weighted_mse(weight: torch.Tensor, base_format: str) -> torch.Tensor:
@@ -123,18 +119,21 @@ def compute_rd_points(
             {"format", "rate", "distortion", "cost"}.
     """
     n_out, n_in = weight.shape
-    rd_table: dict[int, list[dict]] = {}
 
+    # Batch: compute per-channel MSE for each format in one shot
+    mse_per_fmt: dict[str, torch.Tensor] = {}
+    for fmt in formats:
+        mse_per_fmt[fmt] = compute_mse_2d(weight, fmt)  # [N_out]
+
+    rd_table: dict[int, list[dict]] = {}
     for j in range(n_out):
-        channel = weight[j]
         entries = []
         for fmt in formats:
             bits = get_bits_per_element(fmt)
-            distortion = compute_mse(channel, fmt)
             entries.append({
                 "format": fmt,
                 "rate": bits,
-                "distortion": distortion,
+                "distortion": mse_per_fmt[fmt][j].item(),
                 "cost": bits * n_in,
             })
         rd_table[j] = entries
