@@ -18,6 +18,7 @@ def eval_perplexity(
     dataset: str = "wikitext",
     max_samples: Optional[int] = None,
     seq_length: int = 2048,
+    dataset_path: Optional[str] = None,
 ) -> float:
     """Compute perplexity of a model on a text dataset using a sliding window.
 
@@ -33,6 +34,9 @@ def eval_perplexity(
         max_samples: Maximum number of tokens to evaluate. If ``None``,
             evaluates the full test split.
         seq_length: Sliding window / context length. Defaults to 2048.
+        dataset_path: Optional path to a local parquet file. If provided
+            and ends with '.parquet', loads data from this file instead
+            of HuggingFace datasets.
 
     Returns:
         Perplexity as a Python float.
@@ -50,8 +54,13 @@ def eval_perplexity(
 
     device = next(model.parameters()).device
 
-    # Load dataset
-    if dataset == "wikitext":
+    # Load dataset — support local parquet files
+    if dataset_path is not None and dataset_path.endswith('.parquet'):
+        import pandas as pd
+        df = pd.read_parquet(dataset_path)
+        text_col = "text" if "text" in df.columns else df.columns[0]
+        text = "\n\n".join(str(t) for t in df[text_col])
+    elif dataset == "wikitext":
         raw = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         text = "\n\n".join(raw["text"])
     elif dataset == "ptb":

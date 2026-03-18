@@ -7,9 +7,9 @@ a sensitivity score per output channel of shape [N_out].
 Higher sensitivity = channel is harder to quantize = needs more bits.
 
 Available metrics:
-  - "mse": Direct quantization MSE at the lowest format (NVFP4).
+  - "mse": Direct quantization MSE at the lowest format (MXFP4).
            Most accurate, slightly slower.
-  - "weighted_mse": MSE × ||W_j||^2. Accounts for weight magnitude.
+  - "weighted_mse": MSE x ||W_j||^2. Accounts for weight magnitude.
   - "max_over_std": max(|W_j|) / std(W_j). Measures outlier severity.
   - "kurtosis": Excess kurtosis of W_j. Measures tail heaviness.
   - "range_ratio": (max - min) / mean_abs. Measures dynamic range.
@@ -30,7 +30,7 @@ def _sensitivity_mse(weight: torch.Tensor, base_format: str) -> torch.Tensor:
 
 
 def _sensitivity_weighted_mse(weight: torch.Tensor, base_format: str) -> torch.Tensor:
-    """Per-channel MSE × ||W_j||^2."""
+    """Per-channel MSE x ||W_j||^2."""
     mse = _sensitivity_mse(weight, base_format)
     norm_sq = (weight.float() ** 2).sum(dim=1)
     return mse * norm_sq
@@ -79,7 +79,7 @@ _METRIC_FNS = {
 def compute_sensitivity(
     weight: torch.Tensor,
     metric: str = "mse",
-    base_format: str = "NVFP4",
+    base_format: str = "MXFP4",
 ) -> torch.Tensor:
     """Compute per-channel sensitivity scores for a weight matrix.
 
@@ -87,7 +87,7 @@ def compute_sensitivity(
         weight: Float tensor of shape [N_out, N_in].
         metric: One of "mse", "weighted_mse", "max_over_std", "kurtosis",
             "range_ratio".
-        base_format: Format used for MSE-based metrics (default "NVFP4").
+        base_format: Format used for MSE-based metrics (default "MXFP4").
 
     Returns:
         Float32 tensor of shape [N_out] with per-channel sensitivity scores.
@@ -101,9 +101,9 @@ def compute_sensitivity(
 @torch.inference_mode()
 def compute_rd_points(
     weight: torch.Tensor,
-    formats: list[str] = ["NVFP4", "MXFP6", "MXFP8", "FP16"],
+    formats: list[str] = ["MXFP4", "MXFP6", "MXFP8"],
 ) -> dict:
-    """Compute (rate, distortion) pairs for every channel × format combination.
+    """Compute (rate, distortion) pairs for every channel x format combination.
 
     For each output channel j and each format f, computes:
       - rate    = bits_per_element(f)   (bits per weight element)

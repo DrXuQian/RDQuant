@@ -10,10 +10,12 @@ Find:
     subject to the bit budget constraint.
 
 Algorithm:
-  1. For each channel, compute Lagrangian cost: D_j(f) + λ * C_j(f)
+  1. For each channel, compute Lagrangian cost: D_j(f) + lambda * C_j(f)
      for each format f, where D = distortion (MSE), C = bit cost.
-  2. Binary search on λ to find the value where total cost = budget.
-  3. At optimal λ*, each channel independently picks its best format.
+  2. Binary search on lambda to find the value where total cost = budget.
+  3. At optimal lambda*, each channel independently picks its best format.
+  4. After allocation, pad each format group to a multiple of 128 channels
+     by promoting channels at boundaries to the next-higher format.
 
 Returns:
   - AllocationResult with per-channel format assignments, permutation
@@ -30,7 +32,10 @@ from rdquant.core.sensitivity import compute_rd_points
 from rdquant.core.formats import get_bits_per_element
 
 # Canonical format order: lowest bits first
-_FORMAT_ORDER = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
+_FORMAT_ORDER = ["MXFP4", "MXFP6", "MXFP8"]
+
+# Group alignment: each format group must be a multiple of this many channels
+_GROUP_ALIGNMENT = 128
 
 
 @dataclass
@@ -50,7 +55,7 @@ class AllocationResult:
 
 
 def _pick_formats(rd_table: dict, lam: float, formats: list[str]) -> dict[int, str]:
-    """For each channel, pick the format that minimises D_j(f) + λ·C_j(f).
+    """For each channel, pick the format that minimises D_j(f) + lambda*C_j(f).
 
     Args:
         rd_table: Output of compute_rd_points().
@@ -98,6 +103,88 @@ def _total_distortion(rd_table: dict, assignments: dict[int, str]) -> float:
     return total
 
 
+def _align_groups(
+    assignments: dict[int, str],
+    rd_table: dict,
+    formats: list[str],
+    alignment: int = _GROUP_ALIGNMENT,
+) -> dict[int, str]:
+    """Pad each format group to a multiple of `alignment` channels.
+
+    Promotion strategy: for each format group that is not aligned, promote
+    channels at the boundary (those with lowest distortion difference to
+    the next-higher format) to the next-higher format. The highest format
+    group absorbs any remainder from lower groups.
+
+    Args:
+        assignments: Current channel -> format assignments.
+        rd_table: R-D table for distortion lookups.
+        formats: Ordered format list (lowest bits first).
+        alignment: Target alignment (default 128).
+
+    Returns:
+        Updated assignments dict.
+    """
+    if alignment <= 1:
+        return assignments
+
+    n_out = len(assignments)
+    if n_out < alignment:
+        # If total channels < alignment, no alignment needed
+        return assignments
+
+    # Build format groups preserving channel order
+    active_formats = [f for f in _FORMAT_ORDER if f in formats]
+    if len(active_formats) <= 1:
+        return assignments
+
+    groups: dict[str, list[int]] = {f: [] for f in active_formats}
+    for j in sorted(assignments.keys()):
+        groups[assignments[j]].append(j)
+
+    # Get distortion per channel per format for promotion decisions
+    def _get_distortion(ch: int, fmt: str) -> float:
+        for e in rd_table[ch]:
+            if e["format"] == fmt:
+                return e["distortion"]
+        return float("inf")
+
+    # Process from lowest to highest format
+    new_assignments = dict(assignments)
+    for i in range(len(active_formats) - 1):
+        fmt_lo = active_formats[i]
+        fmt_hi = active_formats[i + 1]
+        group = groups[fmt_lo]
+        n_ch = len(group)
+        if n_ch == 0:
+            continue
+
+        remainder = n_ch % alignment
+        if remainder == 0:
+            continue
+
+        # Need to promote `remainder` channels to fmt_hi
+        n_promote = remainder
+
+        # Pick channels with smallest distortion increase when promoted
+        promote_costs = []
+        for ch in group:
+            d_lo = _get_distortion(ch, fmt_lo)
+            d_hi = _get_distortion(ch, fmt_hi)
+            promote_costs.append((d_hi - d_lo, ch))
+
+        # Sort by distortion increase (ascending) — promote cheapest first
+        promote_costs.sort()
+        to_promote = [ch for _, ch in promote_costs[:n_promote]]
+
+        for ch in to_promote:
+            new_assignments[ch] = fmt_hi
+            groups[fmt_lo].remove(ch)
+            groups[fmt_hi].append(ch)
+
+    return new_assignments
+
+
 def _build_result(
     rd_table: dict,
     assignments: dict[int, str],
@@ -111,8 +198,6 @@ def _build_result(
 
     # Compute permutation: group by format in canonical order
     # Within each group preserve original channel order
-    fmt_order = {f: i for i, f in enumerate(_FORMAT_ORDER)}
-    # Only include formats that appear in the provided list, in canonical order
     active_formats = [f for f in _FORMAT_ORDER if f in formats]
 
     groups: dict[str, list[int]] = {f: [] for f in active_formats}
@@ -172,35 +257,40 @@ def allocate(
     budget_avg_bits: float,
     formats: list[str] = None,
     n_elements_per_channel: int = None,
+    align_groups: bool = True,
 ) -> AllocationResult:
     """Find format assignment minimising total distortion subject to a bit budget.
 
-    Uses a Lagrangian λ-sweep with binary search:
-      - λ=0  → all channels pick FP16 (max bits, min distortion)
-      - λ=∞  → all channels pick NVFP4 (min bits, max distortion)
-      - Binary search finds λ* where total_bits ≈ budget
+    Uses a Lagrangian lambda-sweep with binary search:
+      - lambda=0  -> all channels pick MXFP8 (max bits, min distortion)
+      - lambda=inf -> all channels pick MXFP4 (min bits, max distortion)
+      - Binary search finds lambda* where total_bits ~ budget
+
+    After allocation, format groups are aligned to multiples of 128 channels
+    by promoting boundary channels to the next-higher format.
 
     Args:
         rd_table: Output of :func:`~rdquant.core.sensitivity.compute_rd_points`.
         budget_avg_bits: Target average bits per element (e.g. 5.3).
-        formats: Allowed format names. Defaults to ["NVFP4","MXFP6","MXFP8","FP16"].
+        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
         n_elements_per_channel: Number of elements per channel (N_in). Inferred
             from rd_table cost entries if not provided.
+        align_groups: Whether to align format groups to multiples of 128 channels.
+            Defaults to True.
 
     Returns:
         :class:`AllocationResult` with per-channel assignments and statistics.
     """
     if formats is None:
-        formats = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
+        formats = ["MXFP4", "MXFP6", "MXFP8"]
 
     n_out = len(rd_table)
     if n_out == 0:
         raise ValueError("rd_table is empty")
 
-    # Infer n_elements_per_channel from the cost of the 4-bit format entry
+    # Infer n_elements_per_channel from the cost of the first format entry
     if n_elements_per_channel is None:
         first_entries = next(iter(rd_table.values()))
-        # cost = bits * n_in → n_in = cost / bits for any entry with bits > 0
         for e in first_entries:
             if e["rate"] > 0:
                 n_elements_per_channel = e["cost"] // e["rate"]
@@ -217,23 +307,21 @@ def allocate(
     # If budget is outside feasible range, clamp and return immediately
     if budget_total_bits <= min_total:
         assignments = min_bits_assignments
+        if align_groups:
+            assignments = _align_groups(assignments, rd_table, formats)
         return _build_result(rd_table, assignments, n_elements_per_channel, 1e18, formats)
 
     if budget_total_bits >= max_total:
         assignments = max_bits_assignments
+        if align_groups:
+            assignments = _align_groups(assignments, rd_table, formats)
         return _build_result(rd_table, assignments, n_elements_per_channel, 0.0, formats)
 
-    # Binary search on λ
-    # λ=0  → all high-precision (max bits)
-    # λ=∞  → all low-precision (min bits)
-    # We want: total_bits(λ) ≈ budget_total_bits
-    # total_bits is non-increasing in λ, so:
-    #   if total_bits(λ) > budget → increase λ
-    #   if total_bits(λ) < budget → decrease λ
+    # Binary search on lambda
     lambda_lo = 0.0
     lambda_hi = 1.0
 
-    # Expand upper bound until total_bits(λ_hi) <= budget
+    # Expand upper bound until total_bits(lambda_hi) <= budget
     for _ in range(64):
         a = _pick_formats(rd_table, lambda_hi, formats)
         if _total_bits(rd_table, a) <= budget_total_bits:
@@ -253,6 +341,9 @@ def allocate(
     lambda_star = (lambda_lo + lambda_hi) / 2.0
     assignments = _pick_formats(rd_table, lambda_star, formats)
 
+    if align_groups:
+        assignments = _align_groups(assignments, rd_table, formats)
+
     return _build_result(rd_table, assignments, n_elements_per_channel, lambda_star, formats)
 
 
@@ -261,43 +352,47 @@ def allocate_layer(
     budget_avg_bits: float,
     formats: list[str] = None,
     sensitivity_metric: str = "mse",
+    align_groups: bool = True,
 ) -> AllocationResult:
     """Compute R-D points and allocate formats for a single layer.
 
     Args:
         weight: Float tensor of shape [N_out, N_in].
         budget_avg_bits: Target average bits per element.
-        formats: Allowed format names. Defaults to ["NVFP4","MXFP6","MXFP8","FP16"].
+        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
         sensitivity_metric: Unused (allocation uses MSE directly via rd_table).
+        align_groups: Whether to align format groups to multiples of 128 channels.
 
     Returns:
         :class:`AllocationResult` for this layer.
     """
     if formats is None:
-        formats = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
+        formats = ["MXFP4", "MXFP6", "MXFP8"]
     with torch.inference_mode():
         rd_table = compute_rd_points(weight, formats)
-    return allocate(rd_table, budget_avg_bits, formats, weight.shape[1])
+    return allocate(rd_table, budget_avg_bits, formats, weight.shape[1], align_groups=align_groups)
 
 
 def sweep_budgets(
     weight: torch.Tensor,
     budgets: list[float],
     formats: list[str] = None,
+    align_groups: bool = True,
 ) -> list[AllocationResult]:
     """Run allocation at multiple bit budgets, computing rd_table only once.
 
     Args:
         weight: Float tensor of shape [N_out, N_in].
         budgets: List of target average bits per element (e.g. [4, 5, 6, 7, 8]).
-        formats: Allowed format names. Defaults to ["NVFP4","MXFP6","MXFP8","FP16"].
+        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
+        align_groups: Whether to align format groups to multiples of 128 channels.
 
     Returns:
         List of :class:`AllocationResult`, one per budget entry.
     """
     if formats is None:
-        formats = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
+        formats = ["MXFP4", "MXFP6", "MXFP8"]
     with torch.inference_mode():
         rd_table = compute_rd_points(weight, formats)
     n_in = weight.shape[1]
-    return [allocate(rd_table, b, formats, n_in) for b in budgets]
+    return [allocate(rd_table, b, formats, n_in, align_groups=align_groups) for b in budgets]

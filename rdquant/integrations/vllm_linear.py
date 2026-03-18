@@ -1,15 +1,14 @@
 """
 Mixed-precision linear layer for vLLM inference.
 
-Phase 4A (multi-kernel, no new CUDA code):
-  y_fp4 = fp4_gemm(x, w_fp4, scales_fp4)   # using vLLM's FP4 kernel
-  y_fp6 = fp6_gemm(x, w_fp6, scales_fp6)
-  y_fp8 = fp8_gemm(x, w_fp8, scales_fp8)
-  y_fp16 = F.linear(x, w_fp16)
-  y = cat([y_fp4, y_fp6, y_fp8, y_fp16])[inv_perm]
+MXFP8 x MXFPx GEMM per format group:
+  y_mxfp4 = mxfp8_x_mxfp4_gemm(x_mxfp8, w_mxfp4, scales)
+  y_mxfp6 = mxfp8_x_mxfp6_gemm(x_mxfp8, w_mxfp6, scales)
+  y_mxfp8 = mxfp8_x_mxfp8_gemm(x_mxfp8, w_mxfp8, scales)
+  y = cat([y_mxfp4, y_mxfp6, y_mxfp8])[inv_perm]
 
-Phase 4B (future, single-kernel):
-  Based on MxMoE grouped GEMM with micro-kernel specialization.
+Activations are quantized once to MXFP8, then each group performs
+an MXFP8 x MXFPx GEMM.
 """
 
 from __future__ import annotations
@@ -29,9 +28,9 @@ class RDQuantLinear(nn.Module):
     order via the inverse permutation.
 
     Currently falls back to fake-quantization (dequantize then FP32 GEMM)
-    because real FP4/FP6 kernels require custom CUDA extensions.  Once
-    vLLM's FP4/FP8 grouped GEMM kernels are available this class will be
-    updated to use them.
+    because real MX GEMM kernels require custom CUDA extensions. Once
+    vLLM's MXFP8 x MXFPx grouped GEMM kernels are available this class
+    will be updated to use them.
 
     Args:
         in_features: Number of input features.
@@ -81,8 +80,8 @@ class RDQuantLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
-        Phase 4A stub: dequantizes the weight and uses a standard FP32 GEMM.
-        In a future version this will dispatch to per-format vLLM kernels.
+        Stub: dequantizes the weight and uses a standard FP32 GEMM.
+        In a future version this will dispatch to per-format vLLM MXFP8 x MXFPx kernels.
 
         Args:
             x: Input tensor of shape ``[..., in_features]``.
@@ -90,7 +89,6 @@ class RDQuantLinear(nn.Module):
         Returns:
             Output tensor of shape ``[..., out_features]``.
         """
-        # Stub: fall back to fake-quant dequantized matmul
         weight = self.quantized_data.dequantize()  # [out_features, in_features]
         return F.linear(x, weight, self.bias)
 

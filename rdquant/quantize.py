@@ -2,6 +2,9 @@
 End-to-end mixed-precision quantization for HuggingFace (and generic nn.Module) models.
 
 Implements quantize_model(), QuantizedWeight, QuantizedLayer, and QuantizedModel.
+
+All weight formats are MX-only (MXFP4, MXFP6, MXFP8) with optional MXFP8
+activation quantization applied uniformly before each GEMM.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from rdquant.core.formats import quantize, dequantize, get_bits_per_element, QuantizedTensor
+from rdquant.core.formats import quantize, dequantize, get_bits_per_element, MXQuantizedTensor
 from rdquant.core.allocator import allocate_layer, allocate, AllocationResult
 from rdquant.core.sensitivity import compute_rd_points
 
@@ -29,7 +32,7 @@ class QuantizedWeight:
     """Packed quantized weight data for a single linear layer.
 
     Attributes:
-        qtensors: Dict mapping format_name -> QuantizedTensor (for the group of
+        qtensors: Dict mapping format_name -> MXQuantizedTensor (for the group of
             channels assigned to that format).
         permutation: [N_out] index tensor that reorders channels by format.
         inv_permutation: [N_out] inverse permutation to restore original order.
@@ -37,7 +40,7 @@ class QuantizedWeight:
         original_shape: (N_out, N_in) shape of the original weight.
         avg_bits: Average bits per element achieved.
     """
-    qtensors: dict[str, QuantizedTensor]
+    qtensors: dict[str, MXQuantizedTensor]
     permutation: torch.Tensor
     inv_permutation: torch.Tensor
     splits: dict[str, int]
@@ -56,14 +59,11 @@ class QuantizedWeight:
             n_ch = self.splits[fmt]
             if n_ch == 0:
                 continue
-            # dequantize gives shape [n_ch * n_in] (1-D stored)
-            # We stored the group as a 2-D original_shape [n_ch, n_in]
             deq = dequantize(qtensor)  # [n_ch, n_in]
             pieces.append(deq)
 
         # Concatenate in permuted order then apply inv_permutation
         reordered = torch.cat(pieces, dim=0)  # [N_out, N_in] in permuted order
-        # Apply inverse permutation to restore original channel order
         inv_perm = self.inv_permutation
         weight = reordered[inv_perm]
         return weight.float()
@@ -78,12 +78,14 @@ class QuantizedLayer(nn.Module):
 
     Stores a QuantizedWeight and reconstructs the full weight on each forward
     pass using dequantize + inv_permutation before running the standard linear.
+    Optionally applies MXFP8 activation quantization.
 
     Args:
         quantized_weight: The quantized weight data.
         bias: Optional bias tensor (copied from original layer if present).
         in_features: Number of input features.
         out_features: Number of output features.
+        quantize_activation: Whether to apply MXFP8 activation quantization.
     """
 
     def __init__(
@@ -92,21 +94,20 @@ class QuantizedLayer(nn.Module):
         bias: Optional[torch.Tensor],
         in_features: int,
         out_features: int,
+        quantize_activation: bool = True,
     ) -> None:
         super().__init__()
         self.quantized_weight = quantized_weight
         self.in_features = in_features
         self.out_features = out_features
+        self.quantize_activation = quantize_activation
         if bias is not None:
             self.bias = nn.Parameter(bias.clone())
         else:
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Mixed-precision forward: per-format dequant → GEMM → concat → permute.
-
-        Uses grouped GEMMs (one per format) so each can later be swapped for
-        a native Tensor Core kernel.
+        """Mixed-precision forward: optional act quant -> per-format dequant -> GEMM -> concat -> permute.
 
         Args:
             x: Input tensor of shape [..., in_features].
@@ -119,12 +120,14 @@ class QuantizedLayer(nn.Module):
         qw = self.quantized_weight
         return mixed_precision_linear(
             x, qw.qtensors, qw.splits, qw.inv_permutation, self.bias,
+            quantize_activation=self.quantize_activation,
         )
 
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"avg_bits={self.quantized_weight.avg_bits:.2f}"
+            f"avg_bits={self.quantized_weight.avg_bits:.2f}, "
+            f"act_quant={'MXFP8' if self.quantize_activation else 'none'}"
         )
 
 
@@ -177,10 +180,6 @@ class QuantizedModel(nn.Module):
         total_params = 0
         for name, result in self.layer_info.items():
             n_out = len(result.assignments)
-            # Infer n_in from splits and total_bits via avg_bits
-            # avg_bits = total_bits / (n_out * n_in)
-            # We can get n_in from the first rd entry cost / rate
-            # But we don't store rd_table here. Use format_stats.
             total_ch_bits = sum(
                 stats["total_bits"]
                 for stats in result.format_stats.values()
@@ -245,23 +244,22 @@ def _quantize_weight(
     # Reorder channels by format group
     weight_perm = weight[perm]  # [N_out, N_in] in format-grouped order
 
-    qtensors: dict[str, QuantizedTensor] = {}
+    qtensors: dict[str, MXQuantizedTensor] = {}
     offset = 0
     for fmt in result.splits:
         n_ch = result.splits[fmt]
         if n_ch == 0:
             continue
         group = weight_perm[offset: offset + n_ch]  # [n_ch, n_in]
-        # Flatten to 1-D for quantize, store original_shape as [n_ch, n_in]
         flat = group.flatten().float()
         qt = quantize(flat, fmt)
         # Override original_shape to [n_ch, n_in] so dequantize restores 2-D
-        from dataclasses import replace as dc_replace
-        qt = QuantizedTensor(
+        qt = MXQuantizedTensor(
             data=qt.data,
             scales=qt.scales,
             format_name=qt.format_name,
             original_shape=torch.Size([n_ch, n_in]),
+            bits_per_element=qt.bits_per_element,
         )
         qtensors[fmt] = qt
         offset += n_ch
@@ -315,24 +313,27 @@ def quantize_model(
     sensitivity_metric: str = "mse",
     ignore: list[str] = None,
     per_layer_budget: bool = False,
+    quantize_activation: bool = True,
 ) -> QuantizedModel:
     """Quantize all nn.Linear layers of a model using R-D optimal allocation.
 
     Args:
         model: Any nn.Module (HuggingFace PreTrainedModel or custom).
         budget_avg_bits: Target average bits per element across all (or per) layers.
-        formats: Allowed format names. Defaults to ["NVFP4","MXFP6","MXFP8","FP16"].
+        formats: Allowed format names. Defaults to ["MXFP4","MXFP6","MXFP8"].
         sensitivity_metric: Sensitivity metric passed to allocate_layer().
         ignore: List of layer name patterns (fnmatch-style) to skip quantization.
         per_layer_budget: If True, apply budget independently to each layer.
             If False (default), do a global lambda sweep across all layers for
             better cross-layer bit allocation.
+        quantize_activation: If True, apply MXFP8 activation quantization in
+            each QuantizedLayer forward pass. Default True.
 
     Returns:
         QuantizedModel wrapping the modified model.
     """
     if formats is None:
-        formats = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
+        formats = ["MXFP4", "MXFP6", "MXFP8"]
 
     if ignore is None:
         ignore = []
@@ -367,15 +368,6 @@ def quantize_model(
                 all_rd_tables[name] = rd_table
                 all_n_in[name] = weight.shape[1]
 
-        # Combine all rd_tables with globally unique channel keys and run one allocate
-        # Key structure: (layer_name, channel_idx)
-        # We need to flatten into a single rd_table with integer keys for the allocator.
-        # The allocator assumes all channels have the same n_elements_per_channel.
-        # For global allocation with different n_in per layer, we do it per-layer
-        # but share a single lambda_star.
-
-        # Find a common lambda by doing a global bit budget calculation.
-        # We sweep lambda and compute total bits vs budget across all layers.
         n_elements = {name: all_n_in[name] for name, _ in to_quantize}
 
         # Compute total params across all layers to quantize
@@ -418,11 +410,12 @@ def quantize_model(
             lambda_star = (lam_lo + lam_hi) / 2.0
 
         # Now allocate each layer at the global lambda_star
-        from rdquant.core.allocator import _build_result, _pick_formats
+        from rdquant.core.allocator import _build_result, _pick_formats, _align_groups
         for name, layer in to_quantize:
             rd = all_rd_tables[name]
             n_in = all_n_in[name]
             assignments = _pick_formats(rd, lambda_star, formats)
+            assignments = _align_groups(assignments, rd, formats)
             result = _build_result(rd, assignments, n_in, lambda_star, formats)
             layer_info[name] = result
 
@@ -438,6 +431,7 @@ def quantize_model(
                 bias=bias,
                 in_features=layer.in_features,
                 out_features=layer.out_features,
+                quantize_activation=quantize_activation,
             )
             _set_module(model, name, qlayer)
 

@@ -5,6 +5,8 @@ Saves:
   - quantization_config.json: metadata (formats, budget, layer info)
   - weights.pt: full serialised QuantizedModel (torch .pt format)
     Individual weight tensors are also accessible under the same archive.
+
+Weight keys use mxfp4/mxfp6/mxfp8 naming convention.
 """
 
 from __future__ import annotations
@@ -68,7 +70,8 @@ def save_quantized(model: "QuantizedModel", path: str) -> None:
             state[prefix + "original_shape"] = torch.tensor(list(qw.original_shape))
             state[prefix + "avg_bits"] = torch.tensor(qw.avg_bits)
             for fmt, qt in qw.qtensors.items():
-                fp = prefix + f"qtensor.{fmt}."
+                # Use lowercase format names: mxfp4, mxfp6, mxfp8
+                fp = prefix + f"qtensor.{fmt.lower()}."
                 state[fp + "data"] = qt.data
                 state[fp + "scales"] = qt.scales
                 state[fp + "original_shape"] = torch.tensor(list(qt.original_shape))

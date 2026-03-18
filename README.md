@@ -2,28 +2,13 @@
 
 **Rate-Distortion Optimal Mixed-Precision Quantization for LLMs**
 
-RDQuant assigns different numeric formats (NVFP4 / MXFP6 / MXFP8 / FP16) to
+RDQuant assigns different MX numeric formats (MXFP4 / MXFP6 / MXFP8) to
 different output channels of each linear layer in a large language model,
 optimally trading off quantization error against bit cost — without requiring
 any calibration data.
 
----
-
-## Results
-
-WikiText-2 perplexity on **Qwen3-4B** (stride 2048, 32k tokens):
-
-| Method | Avg Bits | WikiText-2 PPL | Size vs FP16 |
-|---|---:|---:|---:|
-| BF16 (baseline) | 16.00 | 13.16 | 100% |
-| Uniform MXFP8 | 8.05 | 12.83 | 50% |
-| **RDQuant mixed-precision** | **5.45** | **13.26** | **34%** |
-| Uniform NVFP4 | 4.00 | 14.74 | 25% |
-
-Key findings:
-- **RDQuant at 5.45 bpw recovers near-BF16 quality** (13.26 vs 13.16 PPL), using only 34% of BF16 storage.
-- Compared to uniform NVFP4 (14.74 PPL), RDQuant reduces PPL by **1.48** (+10%) with only 1.45 extra bits per weight.
-- At equivalent quality (~13.2 PPL), RDQuant uses **5.45 bits** vs MXFP8's **8 bits** — a **32% size reduction**.
+Activations are uniformly quantized to MXFP8 before each GEMM, enabling
+efficient MXFP8 x MXFPx hardware execution.
 
 ---
 
@@ -35,46 +20,45 @@ RDQuant formulates mixed-precision format assignment as a Rate-Distortion optimi
 
 For every output channel *j* of every linear layer, compute the MSE
 introduced by quantizing that channel to each candidate format
-(NVFP4 / MXFP6 / MXFP8 / FP16). This produces an R-D table:
+(MXFP4 / MXFP6 / MXFP8). This produces an R-D table:
 
 ```
-channel j → [(rate=4, distortion=D_fp4), (rate=6, distortion=D_fp6),
-             (rate=8, distortion=D_fp8), (rate=16, distortion=D_fp16)]
+channel j -> [(rate=4, distortion=D_mxfp4), (rate=6, distortion=D_mxfp6),
+              (rate=8, distortion=D_mxfp8)]
 ```
 
 All quantizers are **fully vectorized** with PyTorch — no per-element Python
-loops. NVFP4 uses a 16-entry E2M1 LUT with FP8(E4M3) block scales (group
-size 16). MXFP6/MXFP8 use direct bit-field encoding with per-32-element
-shared exponents following the OCP MX standard.
+loops. All MX formats use per-32-element UE8M0 shared exponents following
+the OCP MX standard. MXFP4 uses nearest-LUT quantization (16 E2M1 values).
+MXFP6/MXFP8 use direct bit-field encoding.
 
 ### Step 2: Lagrangian allocation (`rdquant/core/allocator.py`)
 
 Given a bit budget *B* (e.g. 5.3 avg bits), solve:
 
 ```
-min  Σ_j D_j(f_j)   subject to  Σ_j C_j(f_j) ≤ B
+min  sum_j D_j(f_j)   subject to  sum_j C_j(f_j) <= B
 ```
 
-This decomposes via a Lagrange multiplier λ: each channel independently picks
-the format minimising `D_j(f) + λ · C_j(f)`. Binary search on λ (64
-iterations, precision ~10⁻¹⁹) finds the optimal λ* where total cost meets the
-budget.
+This decomposes via a Lagrange multiplier lambda: each channel independently picks
+the format minimising `D_j(f) + lambda * C_j(f)`. Binary search on lambda (64
+iterations) finds the optimal lambda* where total cost meets the budget.
+
+After allocation, format groups are aligned to multiples of 128 channels for
+efficient hardware execution.
 
 ### Step 3: Global cross-layer budget (default)
 
-When `per_layer_budget=False`, a single λ* is searched across **all** layers
-simultaneously. This allows sensitive layers (e.g. attention V-proj) to
-receive more bits while easy layers (e.g. FFN down-proj) are compressed
-further — yielding better quality than per-layer budgets at the same total
-size.
+When `per_layer_budget=False`, a single lambda* is searched across **all** layers
+simultaneously. This allows sensitive layers to receive more bits while easy
+layers are compressed further.
 
-### Step 4: Fake-quantization inference (`rdquant/quantize.py`)
+### Step 4: Inference with MXFP8 activation quantization
 
-Channels are permuted to group by format (all NVFP4 channels first, then
-MXFP6, MXFP8, FP16). During inference, each group is dequantized, the
-inverse permutation restores original channel order, and a standard
-`F.linear` GEMM is executed. A future vLLM integration will replace this with
-native per-format Tensor Core kernels on NVIDIA Blackwell GPUs.
+Activations are quantized once to MXFP8, then each format group performs an
+MXFP8 x MXFPx GEMM. Channels are permuted to group by format (all MXFP4
+channels first, then MXFP6, MXFP8), and the inverse permutation restores
+original channel order.
 
 ---
 
@@ -82,10 +66,9 @@ native per-format Tensor Core kernels on NVIDIA Blackwell GPUs.
 
 | Format | Bits | Standard | Block Scale |
 |---|---:|---|---|
-| NVFP4 | 4 | NVIDIA FP4 E2M1 | per-16-element FP8(E4M3) block scale |
-| MXFP6 | 6 | OCP MX FP6 E3M2 | per-32-element shared exponent |
-| MXFP8 | 8 | OCP MX FP8 E4M3 | per-32-element shared exponent |
-| FP16 | 16 | IEEE half-precision | lossless passthrough |
+| MXFP4 | 4 | OCP MX FP4 E2M1 | per-32-element UE8M0 shared exponent |
+| MXFP6 | 6 | OCP MX FP6 E3M2 | per-32-element UE8M0 shared exponent |
+| MXFP8 | 8 | OCP MX FP8 E4M3 | per-32-element UE8M0 shared exponent |
 
 ---
 
@@ -95,22 +78,26 @@ native per-format Tensor Core kernels on NVIDIA Blackwell GPUs.
 rdquant/
 ├── rdquant/
 │   ├── core/
-│   │   ├── formats.py          # Vectorized quantize/dequantize for all 4 formats
+│   │   ├── formats.py          # Vectorized quantize/dequantize for MXFP4/MXFP6/MXFP8
+│   │   ├── act_quant.py        # MXFP8 activation quantization
 │   │   ├── sensitivity.py      # Data-free channel sensitivity metrics + R-D profiling
-│   │   └── allocator.py        # Lagrangian R-D optimal format allocation
+│   │   └── allocator.py        # Lagrangian R-D optimal format allocation + 128-alignment
 │   ├── quantize.py             # End-to-end model quantization (QuantizedModel)
+│   ├── ops.py                  # Mixed-precision linear operators
 │   ├── eval.py                 # Perplexity & zero-shot evaluation wrappers
 │   └── integrations/
-│       ├── hf_export.py        # Save/load quantized models (safetensors)
-│       └── vllm_linear.py      # vLLM inference stub (Phase 4)
+│       ├── hf_export.py        # Save/load quantized models
+│       └── vllm_linear.py      # vLLM inference stub (MXFP8 x MXFPx GEMM)
 ├── examples/
 │   ├── quickstart.py           # Minimal quantize + eval example
 │   └── sweep_budget.py         # Sweep bit budgets, print R-D table
 ├── tests/
-│   ├── test_formats.py         # 49 tests: round-trip, MSE monotonicity, edge cases
-│   ├── test_sensitivity.py     # 56 tests: ordering, correlation, determinism
-│   ├── test_allocator.py       # 48 tests: optimality, budget, permutation
-│   └── test_quantize.py        # 14 tests: model quantization end-to-end
+│   ├── test_formats.py         # MX format round-trip, MSE monotonicity, edge cases
+│   ├── test_act_quant.py       # MXFP8 activation quantization tests
+│   ├── test_sensitivity.py     # Ordering, correlation, determinism
+│   ├── test_allocator.py       # Optimality, budget, permutation, alignment
+│   ├── test_quantize.py        # Model quantization end-to-end + act quant
+│   └── test_ops.py             # Mixed-precision linear + activation quantization
 ├── pyproject.toml
 ├── LICENSE                     # Apache 2.0
 └── README.md
@@ -143,11 +130,12 @@ from rdquant import quantize_model
 
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B")
 
-# Quantize to ~5.3 avg bits per weight
+# Quantize to ~5.3 avg bits per weight with MXFP8 activation quantization
 qmodel = quantize_model(
     model,
     budget_avg_bits=5.3,
     ignore=["lm_head", "embed_tokens"],
+    quantize_activation=True,  # MXFP8 activation quantization (default)
 )
 qmodel.print_summary()
 qmodel.save_pretrained("./Qwen3-4B-RDQuant-5.3bit")
@@ -175,10 +163,11 @@ from rdquant import quantize_model
 qmodel = quantize_model(
     model,
     budget_avg_bits=5.3,         # target average bits per weight element
-    formats=["NVFP4","MXFP6","MXFP8","FP16"],
+    formats=["MXFP4","MXFP6","MXFP8"],
     sensitivity_metric="mse",    # "mse" | "weighted_mse" | "kurtosis" | ...
     ignore=["lm_head"],          # layer name patterns to skip
     per_layer_budget=False,      # True = per-layer, False = global lambda
+    quantize_activation=True,    # MXFP8 activation quantization
 )
 ```
 
@@ -214,7 +203,7 @@ scores = compute_sensitivity(weight, metric="max_over_std") # outlier severity
 ## Running Tests
 
 ```bash
-pytest tests/ -v          # 167 tests, all formats + allocator + end-to-end
+pytest tests/ -v          # 231 tests covering all formats + allocator + end-to-end
 ```
 
 ---

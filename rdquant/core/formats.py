@@ -1,15 +1,14 @@
 """
 Numeric format definitions and quantize/dequantize implementations.
 
-Supported formats:
-  - NVFP4:  E2M1 with per-16-element FP8(E4M3) block scale + per-tensor FP32 global scale
-  - MXFP6:  E3M2 or E2M3 with per-32-element shared exponent (OCP MX standard)
-  - MXFP8:  E4M3 or E5M2 with per-32-element shared exponent
-  - FP16:   IEEE half-precision, no quantization needed
+Supported formats (MX-only):
+  - MXFP4:  E2M1 with per-32-element UE8M0 shared exponent
+  - MXFP6:  E3M2 with per-32-element UE8M0 shared exponent
+  - MXFP8:  E4M3 with per-32-element UE8M0 shared exponent
 
 Each format exposes:
-  - bits_per_element: int — the nominal bit-width (4, 6, 8, 16)
-  - quantize(tensor) -> QuantizedTensor  — returns packed data + metadata
+  - bits_per_element: int — the nominal bit-width (4, 6, 8)
+  - quantize(tensor) -> MXQuantizedTensor  — returns packed data + metadata
   - dequantize(qtensor) -> tensor — reconstruct full-precision approximation
   - compute_mse(tensor) -> float — quantize, dequantize, compute MSE (convenience)
 
@@ -20,136 +19,30 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
 
 @dataclass
-class QuantizedTensor:
-    """Container for quantized data and associated metadata."""
-    data: torch.Tensor        # packed/quantized values (indices or float approximations)
-    scales: torch.Tensor      # block scales
-    format_name: str          # "NVFP4", "MXFP6", "MXFP8", "FP16"
+class MXQuantizedTensor:
+    """Container for MX-format quantized data and associated metadata."""
+    data: torch.Tensor        # quantized codes (long)
+    scales: torch.Tensor      # shared exponents (float32), one per 32 elements
+    format_name: str          # "MXFP4", "MXFP6", "MXFP8"
     original_shape: torch.Size
+    bits_per_element: int     # 4, 6, 8
 
 
 # ---------------------------------------------------------------------------
-# FP8 E4M3 helpers (used for NVFP4 block scales)
+# Shared MX block quantization (per-32-element shared exponent)
 # ---------------------------------------------------------------------------
 
-_FP8_E4M3_MAX = 448.0
-_FP8_E4M3_MIN_NORMAL = 2.0 ** (-9)
+_MX_BLOCK_SIZE = 32
 
-
-def _quantize_to_fp8_e4m3(x: torch.Tensor) -> torch.Tensor:
-    """Quantize float tensor to FP8 E4M3 representable values (returned as float32)."""
-    sign = torch.sign(x)
-    abs_x = x.abs().clamp(max=_FP8_E4M3_MAX)
-
-    result = torch.zeros_like(abs_x)
-    nonzero = abs_x >= _FP8_E4M3_MIN_NORMAL / 2.0
-
-    if nonzero.any():
-        v = abs_x[nonzero]
-        exp_f = torch.floor(torch.log2(v.clamp(min=1e-38)))
-        exp_biased = (exp_f + 7).clamp(1, 14)
-        exp_f_clamped = exp_biased - 7
-        scale = 2.0 ** exp_f_clamped
-        mantissa_i = ((v / scale - 1.0) * 8.0).round().clamp(0, 7).long()
-        result[nonzero] = (1.0 + mantissa_i.float() / 8.0) * scale
-
-    return sign * result
-
-
-# ---------------------------------------------------------------------------
-# NVFP4 (E2M1) format — fully vectorized
-# ---------------------------------------------------------------------------
-
-_NVFP4_LUT = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-    dtype=torch.float32,
-)
-_NVFP4_POS_VALUES = _NVFP4_LUT[:8]
-_NVFP4_MAX_VAL = 6.0
-_NVFP4_BLOCK_SIZE = 16
-
-
-def nvfp4_quantize(tensor: torch.Tensor) -> QuantizedTensor:
-    """Quantize a 1D tensor to NVFP4 format (vectorized).
-
-    Args:
-        tensor: 1D float tensor (single output channel weights).
-
-    Returns:
-        QuantizedTensor with data=indices (long), scales=block FP8 scales (float32).
-    """
-    original_shape = tensor.shape
-    flat = tensor.flatten().float()
-    n = flat.shape[0]
-
-    pad = (-n) % _NVFP4_BLOCK_SIZE
-    if pad > 0:
-        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype)])
-
-    n_blocks = flat.shape[0] // _NVFP4_BLOCK_SIZE
-    blocks = flat.view(n_blocks, _NVFP4_BLOCK_SIZE)  # [B, 16]
-
-    # Per-block absmax → scale
-    absmax = blocks.abs().amax(dim=1)  # [B]
-    raw_scale = absmax / _NVFP4_MAX_VAL
-    scale_fp8 = _quantize_to_fp8_e4m3(raw_scale)  # [B]
-    # Avoid div-by-zero for all-zero blocks
-    safe_scale = scale_fp8.clone()
-    safe_scale[safe_scale == 0.0] = 1.0
-
-    # Normalize blocks
-    normalized = blocks / safe_scale.unsqueeze(1)  # [B, 16]
-
-    # Nearest LUT entry: separate sign and magnitude
-    sign = (normalized < 0).long()     # [B, 16]
-    abs_norm = normalized.abs()        # [B, 16]
-
-    # Distances to each positive LUT value — [B, 16, 8]
-    pos_vals = _NVFP4_POS_VALUES.to(flat.device)
-    dists = (abs_norm.unsqueeze(2) - pos_vals).abs()
-    mag_idx = dists.argmin(dim=2)      # [B, 16]
-
-    indices = (mag_idx + sign * 8).view(-1)[:n]  # [n]
-
-    return QuantizedTensor(
-        data=indices,
-        scales=scale_fp8,
-        format_name="NVFP4",
-        original_shape=original_shape,
-    )
-
-
-def nvfp4_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
-    """Dequantize NVFP4 QuantizedTensor back to float32."""
-    indices = qtensor.data
-    scales = qtensor.scales
-    n = indices.shape[0]
-
-    pad = (-n) % _NVFP4_BLOCK_SIZE
-    if pad > 0:
-        indices = torch.cat([indices, torch.zeros(pad, dtype=indices.dtype)])
-
-    n_blocks = indices.shape[0] // _NVFP4_BLOCK_SIZE
-    lut = _NVFP4_LUT.to(indices.device)
-    values = lut[indices].view(n_blocks, _NVFP4_BLOCK_SIZE)
-    values = values * scales.unsqueeze(1)
-    return values.view(-1)[:n].reshape(qtensor.original_shape)
-
-
-# ---------------------------------------------------------------------------
-# Vectorized MX-format quantizer (shared by MXFP6 and MXFP8)
-# ---------------------------------------------------------------------------
 
 def _mx_quantize_blocks(
     flat: torch.Tensor,
-    block_size: int,
+    block_size: int = _MX_BLOCK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute per-block shared exponent and return (normalized blocks, shared_exp).
 
@@ -165,7 +58,7 @@ def _mx_quantize_blocks(
     blocks = flat.view(n_blocks, block_size)
 
     absmax = blocks.abs().amax(dim=1)
-    shared_exp = torch.zeros(n_blocks, dtype=torch.float32)
+    shared_exp = torch.zeros(n_blocks, dtype=torch.float32, device=flat.device)
     nonzero = absmax > 0
     if nonzero.any():
         shared_exp[nonzero] = torch.floor(torch.log2(absmax[nonzero]))
@@ -182,10 +75,10 @@ def _vectorized_encode_fp(
     mantissa_bits: int,
     max_val: float,
 ) -> torch.Tensor:
-    """Vectorized floating-point encode: float → integer code.
+    """Vectorized floating-point encode: float -> integer code.
 
     Directly computes (sign, exponent, mantissa) bit fields for each element.
-    O(n) instead of O(n × LUT_size).
+    O(n) instead of O(n x LUT_size).
 
     Args:
         x: Flat float32 tensor of normalized values.
@@ -197,7 +90,6 @@ def _vectorized_encode_fp(
     Returns:
         Long tensor of integer codes, same shape as x.
     """
-    total_bits = 1 + int(max_exp).bit_length() + mantissa_bits  # not used, just doc
     mantissa_levels = 1 << mantissa_bits  # 2^m
 
     sign_bit = (x < 0).long()
@@ -241,28 +133,87 @@ def _vectorized_encode_fp(
     return code
 
 
-def _mx_dequantize(qtensor: QuantizedTensor, lut: torch.Tensor, block_size: int) -> torch.Tensor:
-    """Dequantize an MX-format QuantizedTensor back to float32."""
+def _mx_dequantize(qtensor: MXQuantizedTensor, lut: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Dequantize an MX-format MXQuantizedTensor back to float32."""
     codes = qtensor.data
     shared_exps = qtensor.scales
     n = codes.shape[0]
 
     pad = (-n) % block_size
     if pad > 0:
-        codes = torch.cat([codes, torch.zeros(pad, dtype=codes.dtype)])
+        codes = torch.cat([codes, torch.zeros(pad, dtype=codes.dtype, device=codes.device)])
 
     n_blocks = codes.shape[0] // block_size
     lut_d = lut.to(codes.device)
     values = lut_d[codes].view(n_blocks, block_size)
-    values = values * (2.0 ** shared_exps).unsqueeze(1)
+    values = values * (2.0 ** shared_exps.to(values.device)).unsqueeze(1)
     return values.view(-1)[:n].reshape(qtensor.original_shape)
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 (E2M1) — per-32-element shared exponent, nearest-LUT quantization
+# ---------------------------------------------------------------------------
+
+# Magnitude grid for E2M1: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+# Full signed LUT: 16 entries (8 positive including 0, 8 negative including -0)
+_MXFP4_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
+_MXFP4_POS_VALUES = _MXFP4_LUT[:8]
+_MXFP4_MAX_VAL = 6.0
+
+
+def mxfp4_quantize(tensor: torch.Tensor) -> MXQuantizedTensor:
+    """Quantize a 1D tensor to MXFP4 E2M1 with per-32-element shared exponent.
+
+    Args:
+        tensor: 1D float tensor.
+
+    Returns:
+        MXQuantizedTensor with data=indices (long), scales=shared exponents (float32).
+    """
+    original_shape = tensor.shape
+    flat = tensor.flatten().float()
+    n = flat.shape[0]
+
+    pad = (-n) % _MX_BLOCK_SIZE
+    if pad > 0:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype, device=flat.device)])
+
+    normalized, shared_exp = _mx_quantize_blocks(flat, _MX_BLOCK_SIZE)
+
+    # Nearest LUT entry: separate sign and magnitude
+    norm_flat = normalized.reshape(-1)
+    sign = (norm_flat < 0).long()
+    abs_norm = norm_flat.abs()
+
+    # Distances to each positive LUT value — [N, 8]
+    pos_vals = _MXFP4_POS_VALUES.to(flat.device)
+    dists = (abs_norm.unsqueeze(1) - pos_vals).abs()
+    mag_idx = dists.argmin(dim=1)  # [N]
+
+    indices = (mag_idx + sign * 8)[:n]
+
+    return MXQuantizedTensor(
+        data=indices,
+        scales=shared_exp,
+        format_name="MXFP4",
+        original_shape=original_shape,
+        bits_per_element=4,
+    )
+
+
+def mxfp4_dequantize(qtensor: MXQuantizedTensor) -> torch.Tensor:
+    """Dequantize MXFP4 MXQuantizedTensor back to float32."""
+    return _mx_dequantize(qtensor, _MXFP4_LUT, _MX_BLOCK_SIZE)
 
 
 # ---------------------------------------------------------------------------
 # MXFP6 (OCP MX, E3M2)
 # ---------------------------------------------------------------------------
 
-_MXFP6_BLOCK_SIZE = 32
 _MXFP6_BIAS = 3
 _MXFP6_MAX_EXP = 6
 _MXFP6_MANTISSA_BITS = 2
@@ -290,43 +241,45 @@ def _build_fp6_e3m2_lut() -> torch.Tensor:
 _MXFP6_LUT = _build_fp6_e3m2_lut()
 
 
-def mxfp6_quantize(tensor: torch.Tensor) -> QuantizedTensor:
+def mxfp6_quantize(tensor: torch.Tensor) -> MXQuantizedTensor:
     """Quantize a 1D tensor to MXFP6 E3M2 with per-32-element shared exponent.
 
     Args:
         tensor: 1D float tensor.
 
     Returns:
-        QuantizedTensor with data=fp6 codes (long), scales=shared_exponents (float).
+        MXQuantizedTensor with data=fp6 codes (long), scales=shared_exponents (float).
     """
     original_shape = tensor.shape
     flat = tensor.flatten().float()
     n = flat.shape[0]
-    pad = (-n) % _MXFP6_BLOCK_SIZE
+    pad = (-n) % _MX_BLOCK_SIZE
     if pad > 0:
-        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype)])
+        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype, device=flat.device)])
 
-    normalized, shared_exp = _mx_quantize_blocks(flat, _MXFP6_BLOCK_SIZE)
+    normalized, shared_exp = _mx_quantize_blocks(flat, _MX_BLOCK_SIZE)
     codes = _vectorized_encode_fp(
         normalized.reshape(-1),
         bias=_MXFP6_BIAS, max_exp=_MXFP6_MAX_EXP,
         mantissa_bits=_MXFP6_MANTISSA_BITS, max_val=_MXFP6_MAX_VAL,
     )[:n]
 
-    return QuantizedTensor(data=codes, scales=shared_exp,
-                           format_name="MXFP6", original_shape=original_shape)
+    return MXQuantizedTensor(
+        data=codes, scales=shared_exp,
+        format_name="MXFP6", original_shape=original_shape,
+        bits_per_element=6,
+    )
 
 
-def mxfp6_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
-    """Dequantize MXFP6 QuantizedTensor back to float32."""
-    return _mx_dequantize(qtensor, _MXFP6_LUT, _MXFP6_BLOCK_SIZE)
+def mxfp6_dequantize(qtensor: MXQuantizedTensor) -> torch.Tensor:
+    """Dequantize MXFP6 MXQuantizedTensor back to float32."""
+    return _mx_dequantize(qtensor, _MXFP6_LUT, _MX_BLOCK_SIZE)
 
 
 # ---------------------------------------------------------------------------
 # MXFP8 (OCP MX, E4M3)
 # ---------------------------------------------------------------------------
 
-_MXFP8_BLOCK_SIZE = 32
 _MXFP8_E4M3_BIAS = 7
 _MXFP8_E4M3_MAX_EXP = 14
 _MXFP8_E4M3_MANTISSA_BITS = 3
@@ -357,62 +310,39 @@ _MXFP8_E4M3_LUT = torch.where(torch.isnan(_MXFP8_E4M3_LUT),
                                 _MXFP8_E4M3_LUT)
 
 
-def mxfp8_quantize(tensor: torch.Tensor) -> QuantizedTensor:
+def mxfp8_quantize(tensor: torch.Tensor) -> MXQuantizedTensor:
     """Quantize a 1D tensor to MXFP8 E4M3 with per-32-element shared exponent.
 
     Args:
         tensor: 1D float tensor.
 
     Returns:
-        QuantizedTensor with data=fp8 codes (long), scales=shared_exponents (float).
+        MXQuantizedTensor with data=fp8 codes (long), scales=shared_exponents (float).
     """
     original_shape = tensor.shape
     flat = tensor.flatten().float()
     n = flat.shape[0]
-    pad = (-n) % _MXFP8_BLOCK_SIZE
+    pad = (-n) % _MX_BLOCK_SIZE
     if pad > 0:
-        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype)])
+        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype, device=flat.device)])
 
-    normalized, shared_exp = _mx_quantize_blocks(flat, _MXFP8_BLOCK_SIZE)
+    normalized, shared_exp = _mx_quantize_blocks(flat, _MX_BLOCK_SIZE)
     codes = _vectorized_encode_fp(
         normalized.reshape(-1),
         bias=_MXFP8_E4M3_BIAS, max_exp=_MXFP8_E4M3_MAX_EXP,
         mantissa_bits=_MXFP8_E4M3_MANTISSA_BITS, max_val=_MXFP8_E4M3_MAX_VAL,
     )[:n]
 
-    return QuantizedTensor(data=codes, scales=shared_exp,
-                           format_name="MXFP8", original_shape=original_shape)
-
-
-def mxfp8_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
-    """Dequantize MXFP8 QuantizedTensor back to float32."""
-    return _mx_dequantize(qtensor, _MXFP8_E4M3_LUT, _MXFP8_BLOCK_SIZE)
-
-
-# ---------------------------------------------------------------------------
-# FP16 (passthrough)
-# ---------------------------------------------------------------------------
-
-def fp16_quantize(tensor: torch.Tensor) -> QuantizedTensor:
-    """'Quantize' to FP16 — just cast and store.
-
-    Args:
-        tensor: 1D float tensor.
-
-    Returns:
-        QuantizedTensor with data=float16 tensor, scales=empty.
-    """
-    return QuantizedTensor(
-        data=tensor.flatten().half(),
-        scales=torch.empty(0),
-        format_name="FP16",
-        original_shape=tensor.shape,
+    return MXQuantizedTensor(
+        data=codes, scales=shared_exp,
+        format_name="MXFP8", original_shape=original_shape,
+        bits_per_element=8,
     )
 
 
-def fp16_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
-    """Dequantize FP16 QuantizedTensor back to float32."""
-    return qtensor.data.float().reshape(qtensor.original_shape)
+def mxfp8_dequantize(qtensor: MXQuantizedTensor) -> torch.Tensor:
+    """Dequantize MXFP8 MXQuantizedTensor back to float32."""
+    return _mx_dequantize(qtensor, _MXFP8_E4M3_LUT, _MX_BLOCK_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -420,10 +350,10 @@ def fp16_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 _FORMATS: dict[str, dict] = {
-    "NVFP4": {
+    "MXFP4": {
         "bits_per_element": 4,
-        "quantize": nvfp4_quantize,
-        "dequantize": nvfp4_dequantize,
+        "quantize": mxfp4_quantize,
+        "dequantize": mxfp4_dequantize,
     },
     "MXFP6": {
         "bits_per_element": 6,
@@ -435,11 +365,6 @@ _FORMATS: dict[str, dict] = {
         "quantize": mxfp8_quantize,
         "dequantize": mxfp8_dequantize,
     },
-    "FP16": {
-        "bits_per_element": 16,
-        "quantize": fp16_quantize,
-        "dequantize": fp16_dequantize,
-    },
 }
 
 
@@ -447,7 +372,7 @@ def get_bits_per_element(format_name: str) -> int:
     """Return nominal bits-per-element for the given format name.
 
     Args:
-        format_name: One of "NVFP4", "MXFP6", "MXFP8", "FP16".
+        format_name: One of "MXFP4", "MXFP6", "MXFP8".
 
     Returns:
         Integer bit-width.
@@ -455,25 +380,25 @@ def get_bits_per_element(format_name: str) -> int:
     return _FORMATS[format_name]["bits_per_element"]
 
 
-def quantize(tensor: torch.Tensor, format_name: str) -> QuantizedTensor:
+def quantize(tensor: torch.Tensor, format_name: str) -> MXQuantizedTensor:
     """Quantize a 1D tensor using the specified format.
 
     Args:
         tensor: 1D float tensor (single output channel's weights).
-        format_name: One of "NVFP4", "MXFP6", "MXFP8", "FP16".
+        format_name: One of "MXFP4", "MXFP6", "MXFP8".
 
     Returns:
-        QuantizedTensor containing packed data and metadata.
+        MXQuantizedTensor containing packed data and metadata.
     """
     with torch.no_grad():
         return _FORMATS[format_name]["quantize"](tensor)
 
 
-def dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
-    """Dequantize a QuantizedTensor back to float32.
+def dequantize(qtensor: MXQuantizedTensor) -> torch.Tensor:
+    """Dequantize a MXQuantizedTensor back to float32.
 
     Args:
-        qtensor: QuantizedTensor produced by quantize().
+        qtensor: MXQuantizedTensor produced by quantize().
 
     Returns:
         Float32 tensor of original shape.
@@ -487,7 +412,7 @@ def compute_mse(tensor: torch.Tensor, format_name: str) -> float:
 
     Args:
         tensor: 1D float tensor.
-        format_name: One of "NVFP4", "MXFP6", "MXFP8", "FP16".
+        format_name: One of "MXFP4", "MXFP6", "MXFP8".
 
     Returns:
         Mean squared error as a Python float.
@@ -507,7 +432,7 @@ def compute_mse_2d(weight: torch.Tensor, format_name: str) -> torch.Tensor:
 
     Args:
         weight: Float tensor of shape [N_out, N_in].
-        format_name: One of "NVFP4", "MXFP6", "MXFP8", "FP16".
+        format_name: One of "MXFP4", "MXFP6", "MXFP8".
 
     Returns:
         Float32 tensor of shape [N_out] with per-row MSE values.

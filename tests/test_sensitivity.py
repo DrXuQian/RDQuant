@@ -20,7 +20,7 @@ from rdquant.core.formats import get_bits_per_element
 torch.manual_seed(42)
 
 METRICS = ["mse", "weighted_mse", "max_over_std", "kurtosis", "range_ratio"]
-FORMATS = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
+FORMATS = ["MXFP4", "MXFP6", "MXFP8"]
 
 
 def _rand_weight(n_out: int, n_in: int, seed: int = 42) -> torch.Tensor:
@@ -63,16 +63,11 @@ class TestShape:
 # ---------------------------------------------------------------------------
 
 class TestSensitivityOrdering:
-    """
-    Build a weight matrix where channel 0 is a standard normal and
-    channel 1 has a massive outlier. Channel 1 should be harder to quantize.
-    """
-
     def _make_outlier_weight(self) -> torch.Tensor:
         g = torch.Generator()
         g.manual_seed(0)
         w = torch.randn(2, 256, generator=g)
-        w[1, 0] = 1000.0   # inject outlier into channel 1
+        w[1, 0] = 1000.0
         return w
 
     @pytest.mark.parametrize("metric", METRICS)
@@ -87,9 +82,16 @@ class TestSensitivityOrdering:
     def test_mse_base_format_kwarg(self):
         """mse metric should accept different base formats."""
         w = _rand_weight(8, 64)
-        for fmt in ["NVFP4", "MXFP6", "MXFP8"]:
+        for fmt in FORMATS:
             scores = compute_sensitivity(w, metric="mse", base_format=fmt)
             assert scores.shape == (8,)
+
+    def test_default_base_format_is_mxfp4(self):
+        """Default base_format should be MXFP4."""
+        w = _rand_weight(8, 64)
+        s1 = compute_sensitivity(w, metric="mse")
+        s2 = compute_sensitivity(w, metric="mse", base_format="MXFP4")
+        assert torch.allclose(s1, s2)
 
 
 # ---------------------------------------------------------------------------
@@ -97,22 +99,16 @@ class TestSensitivityOrdering:
 # ---------------------------------------------------------------------------
 
 def _make_outlier_gradient_weight(n_out: int = 20, n_in: int = 256, seed: int = 42) -> torch.Tensor:
-    """Weight matrix where channel j has a single outlier of magnitude (j+1)*2.
-
-    All shape metrics (max_over_std, kurtosis) and distortion metrics (mse) should
-    increase monotonically with j, enabling rank-correlation tests.
-    """
     g = torch.Generator()
     g.manual_seed(seed)
     w = torch.randn(n_out, n_in, generator=g)
     for j in range(n_out):
-        w[j, 0] = (j + 1) * 2.0  # outlier at index 0 with growing magnitude
+        w[j, 0] = (j + 1) * 2.0
     return w
 
 
 class TestMetricAgreement:
     def test_rank_correlation_mse_weighted_mse(self):
-        """mse and weighted_mse both scale with channel magnitude -> high correlation."""
         w = _rand_weight(32, 128)
         s1 = compute_sensitivity(w, metric="mse")
         s2 = compute_sensitivity(w, metric="weighted_mse")
@@ -120,7 +116,6 @@ class TestMetricAgreement:
         assert rho > 0.7, f"mse vs weighted_mse rank corr = {rho:.3f} < 0.7"
 
     def test_rank_correlation_mse_max_over_std(self):
-        """On data with increasing outlier magnitude, max_over_std correlates with mse."""
         w = _make_outlier_gradient_weight()
         s1 = compute_sensitivity(w, metric="mse")
         s2 = compute_sensitivity(w, metric="max_over_std")
@@ -128,7 +123,6 @@ class TestMetricAgreement:
         assert rho > 0.7, f"mse vs max_over_std rank corr = {rho:.3f} < 0.7"
 
     def test_rank_correlation_mse_kurtosis(self):
-        """On data with increasing outlier magnitude, kurtosis correlates with mse."""
         w = _make_outlier_gradient_weight()
         s1 = compute_sensitivity(w, metric="mse")
         s2 = compute_sensitivity(w, metric="kurtosis")
@@ -179,8 +173,7 @@ class TestComputeRDPoints:
         w = _rand_weight(4, 32)
         rd = compute_rd_points(w, FORMATS)
         for j, entries in rd.items():
-            assert len(entries) == len(FORMATS), \
-                f"Channel {j}: expected {len(FORMATS)} entries, got {len(entries)}"
+            assert len(entries) == len(FORMATS)
 
     def test_entry_fields(self):
         w = _rand_weight(4, 32)
@@ -193,15 +186,13 @@ class TestComputeRDPoints:
                 assert "cost" in entry
 
     def test_cost_formula(self):
-        """cost = bits_per_element * N_in"""
         n_in = 64
         w = _rand_weight(4, n_in)
         rd = compute_rd_points(w, FORMATS)
         for j, entries in rd.items():
             for entry in entries:
                 expected_cost = get_bits_per_element(entry["format"]) * n_in
-                assert entry["cost"] == expected_cost, \
-                    f"Channel {j}, {entry['format']}: cost={entry['cost']}, expected {expected_cost}"
+                assert entry["cost"] == expected_cost
 
     def test_rate_matches_bits_per_element(self):
         w = _rand_weight(4, 32)
@@ -211,19 +202,15 @@ class TestComputeRDPoints:
                 assert entry["rate"] == get_bits_per_element(entry["format"])
 
     def test_distortion_ordering(self):
-        """For each channel: D(NVFP4) >= D(MXFP6) >= D(MXFP8) >= D(FP16)."""
+        """For each channel: D(MXFP4) >= D(MXFP6) >= D(MXFP8)."""
         w = _rand_weight(16, 128)
         rd = compute_rd_points(w, FORMATS)
         fmt_order = {f: i for i, f in enumerate(FORMATS)}
         for j, entries in rd.items():
-            # Sort by format order
             sorted_entries = sorted(entries, key=lambda e: fmt_order[e["format"]])
             distortions = [e["distortion"] for e in sorted_entries]
             for k in range(len(distortions) - 1):
-                assert distortions[k] >= distortions[k + 1] - 1e-12, (
-                    f"Channel {j}: distortion not monotone: "
-                    f"{FORMATS[k]}={distortions[k]:.6e} < {FORMATS[k+1]}={distortions[k+1]:.6e}"
-                )
+                assert distortions[k] >= distortions[k + 1] - 1e-12
 
     def test_distortion_nonnegative(self):
         w = _rand_weight(8, 64)
@@ -232,20 +219,20 @@ class TestComputeRDPoints:
             for entry in entries:
                 assert entry["distortion"] >= 0.0
 
-    def test_fp16_distortion_near_zero(self):
+    def test_mxfp8_distortion_small(self):
         w = _rand_weight(8, 64)
         rd = compute_rd_points(w, FORMATS)
         for j, entries in rd.items():
-            fp16_entry = next(e for e in entries if e["format"] == "FP16")
-            assert fp16_entry["distortion"] < 1e-6
+            mxfp8_entry = next(e for e in entries if e["format"] == "MXFP8")
+            assert mxfp8_entry["distortion"] < 0.01
 
     def test_custom_format_subset(self):
         w = _rand_weight(4, 32)
-        rd = compute_rd_points(w, formats=["NVFP4", "FP16"])
+        rd = compute_rd_points(w, formats=["MXFP4", "MXFP8"])
         for j, entries in rd.items():
             assert len(entries) == 2
             fmts = {e["format"] for e in entries}
-            assert fmts == {"NVFP4", "FP16"}
+            assert fmts == {"MXFP4", "MXFP8"}
 
     @pytest.mark.parametrize("n_out,n_in", [(4, 32), (16, 128)])
     def test_various_shapes(self, n_out, n_in):
@@ -259,6 +246,14 @@ class TestComputeRDPoints:
         for j, entries in rd.items():
             for entry in entries:
                 assert entry["distortion"] == 0.0
+
+    def test_default_formats(self):
+        """Default formats should be MXFP4, MXFP6, MXFP8."""
+        w = _rand_weight(4, 32)
+        rd = compute_rd_points(w)
+        for j, entries in rd.items():
+            fmts = {e["format"] for e in entries}
+            assert fmts == {"MXFP4", "MXFP6", "MXFP8"}
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +270,6 @@ class TestFiniteScores:
 
     @pytest.mark.parametrize("metric", ["max_over_std", "kurtosis", "range_ratio"])
     def test_constant_channel_no_crash(self, metric):
-        """Channels with zero variance shouldn't crash (handled by clamping)."""
         w = torch.zeros(4, 64)
         scores = compute_sensitivity(w, metric=metric)
         assert scores.shape == (4,)

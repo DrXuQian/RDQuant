@@ -2,13 +2,14 @@
 Tests for rdquant/core/allocator.py
 
 Covers:
-  - Budget satisfaction: actual avg_bits ≈ budget (within ±0.1)
+  - Budget satisfaction: actual avg_bits ~ budget (within +/-0.5)
   - Optimality: 2-channel exhaustive check
-  - Monotonicity: larger budget → lower total distortion
-  - Extreme budgets: budget=4 → all NVFP4; budget=16 → all FP16
+  - Monotonicity: larger budget -> lower total distortion
+  - Extreme budgets: budget=4 -> all MXFP4; budget=8 -> all MXFP8
   - Permutation correctness: inv_permutation[permutation] = identity
   - Splits sum to N_out
-  - Lambda monotonicity: higher lambda → fewer bits
+  - Lambda monotonicity: higher lambda -> fewer bits
+  - Group alignment to 128 channels
 """
 
 from __future__ import annotations
@@ -20,9 +21,11 @@ import torch
 
 from rdquant.core.allocator import (
     AllocationResult,
+    _GROUP_ALIGNMENT,
     _pick_formats,
     _total_bits,
     _total_distortion,
+    _align_groups,
     allocate,
     allocate_layer,
     sweep_budgets,
@@ -31,8 +34,8 @@ from rdquant.core.sensitivity import compute_rd_points
 
 torch.manual_seed(42)
 
-FORMATS = ["NVFP4", "MXFP6", "MXFP8", "FP16"]
-BITS = {"NVFP4": 4, "MXFP6": 6, "MXFP8": 8, "FP16": 16}
+FORMATS = ["MXFP4", "MXFP6", "MXFP8"]
+BITS = {"MXFP4": 4, "MXFP6": 6, "MXFP8": 8}
 
 
 def _rand_weight(n_out: int, n_in: int, seed: int = 42) -> torch.Tensor:
@@ -51,37 +54,35 @@ def _rd_table(n_out: int, n_in: int, seed: int = 42) -> dict:
 # ---------------------------------------------------------------------------
 
 class TestBudgetSatisfaction:
-    @pytest.mark.parametrize("budget", [4.5, 5.0, 6.0, 8.0, 10.0])
+    @pytest.mark.parametrize("budget", [4.5, 5.0, 6.0, 7.0, 8.0])
     def test_avg_bits_within_tolerance(self, budget):
         rd = _rd_table(32, 128)
-        result = allocate(rd, budget, FORMATS, 128)
+        result = allocate(rd, budget, FORMATS, 128, align_groups=False)
         assert abs(result.avg_bits - budget) <= 0.5, (
-            f"budget={budget}: avg_bits={result.avg_bits:.3f}, diff={abs(result.avg_bits - budget):.3f}"
+            f"budget={budget}: avg_bits={result.avg_bits:.3f}"
         )
 
-    def test_budget_4_all_nvfp4(self):
-        """Minimum possible budget → all channels get NVFP4."""
+    def test_budget_4_all_mxfp4(self):
         rd = _rd_table(16, 64)
-        result = allocate(rd, 4.0, FORMATS, 64)
+        result = allocate(rd, 4.0, FORMATS, 64, align_groups=False)
         for j, fmt in result.assignments.items():
-            assert fmt == "NVFP4", f"Channel {j} got {fmt}, expected NVFP4"
+            assert fmt == "MXFP4"
 
-    def test_budget_16_all_fp16(self):
-        """Maximum possible budget → all channels get FP16."""
+    def test_budget_8_all_mxfp8(self):
         rd = _rd_table(16, 64)
-        result = allocate(rd, 16.0, FORMATS, 64)
+        result = allocate(rd, 8.0, FORMATS, 64, align_groups=False)
         for j, fmt in result.assignments.items():
-            assert fmt == "FP16", f"Channel {j} got {fmt}, expected FP16"
+            assert fmt == "MXFP8"
 
     def test_budget_just_above_minimum(self):
         rd = _rd_table(16, 64)
-        result = allocate(rd, 4.01, FORMATS, 64)
+        result = allocate(rd, 4.01, FORMATS, 64, align_groups=False)
         assert result.avg_bits >= 4.0
 
     def test_budget_just_below_maximum(self):
         rd = _rd_table(16, 64)
-        result = allocate(rd, 15.99, FORMATS, 64)
-        assert result.avg_bits <= 16.0
+        result = allocate(rd, 7.99, FORMATS, 64, align_groups=False)
+        assert result.avg_bits <= 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +91,6 @@ class TestBudgetSatisfaction:
 
 class TestOptimality:
     def _brute_force_best(self, rd_table: dict, budget_avg_bits: float, n_in: int) -> float:
-        """Return minimum total distortion achievable within budget by exhaustive search."""
         channels = sorted(rd_table.keys())
         n_out = len(channels)
         budget_total = budget_avg_bits * n_out * n_in
@@ -104,49 +104,39 @@ class TestOptimality:
                     best_dist = dist
         return best_dist
 
-    @pytest.mark.parametrize("budget", [5.0, 6.0, 8.0, 10.0, 12.0])
+    @pytest.mark.parametrize("budget", [5.0, 6.0, 7.0, 8.0])
     def test_2_channel_optimal(self, budget):
         rd = _rd_table(2, 64)
-        result = allocate(rd, budget, FORMATS, 64)
+        result = allocate(rd, budget, FORMATS, 64, align_groups=False)
         brute_dist = self._brute_force_best(rd, budget, 64)
-        # Allocator should match or beat brute force (up to floating-point ties)
-        assert result.total_distortion <= brute_dist + 1e-9 * max(brute_dist, 1.0), (
-            f"budget={budget}: allocator_dist={result.total_distortion:.6e} > "
-            f"brute_force_dist={brute_dist:.6e}"
-        )
+        assert result.total_distortion <= brute_dist + 1e-9 * max(brute_dist, 1.0)
 
-    @pytest.mark.parametrize("budget", [5.0, 8.0, 12.0])
+    @pytest.mark.parametrize("budget", [5.0, 7.0])
     def test_4_channel_optimal(self, budget):
         rd = _rd_table(4, 64)
-        result = allocate(rd, budget, FORMATS, 64)
+        result = allocate(rd, budget, FORMATS, 64, align_groups=False)
         brute_dist = self._brute_force_best(rd, budget, 64)
         assert result.total_distortion <= brute_dist + 1e-9 * max(brute_dist, 1.0)
 
 
 # ---------------------------------------------------------------------------
-# Monotonicity: larger budget → lower total distortion
+# Monotonicity: larger budget -> lower total distortion
 # ---------------------------------------------------------------------------
 
 class TestMonotonicity:
     def test_distortion_decreases_with_budget(self):
         rd = _rd_table(16, 64)
-        budgets = [4.5, 5.0, 6.0, 8.0, 12.0, 16.0]
-        distortions = [allocate(rd, b, FORMATS, 64).total_distortion for b in budgets]
+        budgets = [4.5, 5.0, 6.0, 7.0, 8.0]
+        distortions = [allocate(rd, b, FORMATS, 64, align_groups=False).total_distortion for b in budgets]
         for i in range(len(distortions) - 1):
-            assert distortions[i] >= distortions[i + 1] - 1e-12, (
-                f"distortion not monotone: budget={budgets[i]} gives dist={distortions[i]:.6e} "
-                f"but budget={budgets[i+1]} gives dist={distortions[i+1]:.6e}"
-            )
+            assert distortions[i] >= distortions[i + 1] - 1e-12
 
     def test_avg_bits_increases_with_budget(self):
         rd = _rd_table(16, 64)
-        budgets = [4.5, 5.0, 6.0, 8.0, 12.0]
-        avg_bits = [allocate(rd, b, FORMATS, 64).avg_bits for b in budgets]
+        budgets = [4.5, 5.0, 6.0, 7.0]
+        avg_bits = [allocate(rd, b, FORMATS, 64, align_groups=False).avg_bits for b in budgets]
         for i in range(len(avg_bits) - 1):
-            assert avg_bits[i] <= avg_bits[i + 1] + 0.5, (
-                f"avg_bits not monotone: budget={budgets[i]} → {avg_bits[i]:.3f}, "
-                f"budget={budgets[i+1]} → {avg_bits[i+1]:.3f}"
-            )
+            assert avg_bits[i] <= avg_bits[i + 1] + 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -159,53 +149,44 @@ class TestPermutation:
         inv = result.inv_permutation
         assert perm.shape == (n_out,)
         assert inv.shape == (n_out,)
-        # inv[perm] == identity
         identity = inv[perm]
         expected = torch.arange(n_out)
-        assert torch.equal(identity, expected), f"inv_permutation[permutation] != identity"
-        # perm[inv] == identity
+        assert torch.equal(identity, expected)
         identity2 = perm[inv]
-        assert torch.equal(identity2, expected), f"permutation[inv_permutation] != identity"
+        assert torch.equal(identity2, expected)
 
-    @pytest.mark.parametrize("budget", [4.5, 6.0, 10.0, 16.0])
+    @pytest.mark.parametrize("budget", [4.5, 6.0, 8.0])
     def test_permutation_is_inverse(self, budget):
         rd = _rd_table(32, 64)
-        result = allocate(rd, budget, FORMATS, 64)
+        result = allocate(rd, budget, FORMATS, 64, align_groups=False)
         self._check_permutation(result, 32)
 
     def test_permutation_groups_by_format(self):
-        """Channels in permuted order should be grouped by format."""
         rd = _rd_table(32, 64)
-        result = allocate(rd, 7.0, FORMATS, 64)
+        result = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
         perm = result.permutation.tolist()
-
-        # Identify format boundaries
         prev_fmt_idx = -1
         for pos, orig_ch in enumerate(perm):
             fmt = result.assignments[orig_ch]
             fmt_idx = FORMATS.index(fmt) if fmt in FORMATS else -1
-            assert fmt_idx >= prev_fmt_idx, (
-                f"Format ordering violated at position {pos}: "
-                f"channel {orig_ch} has {fmt} (idx {fmt_idx}) after a channel with idx {prev_fmt_idx}"
-            )
-            prev_fmt_idx = fmt_idx
+            assert fmt_idx >= prev_fmt_idx
 
     def test_splits_sum_to_n_out(self):
         n_out = 32
         rd = _rd_table(n_out, 64)
-        result = allocate(rd, 7.0, FORMATS, 64)
+        result = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
         total = sum(result.splits.values())
-        assert total == n_out, f"splits sum {total} != n_out {n_out}"
+        assert total == n_out
 
     def test_splits_nonnegative(self):
         rd = _rd_table(16, 64)
-        result = allocate(rd, 7.0, FORMATS, 64)
+        result = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
         for fmt, cnt in result.splits.items():
-            assert cnt >= 0, f"splits[{fmt}] = {cnt} < 0"
+            assert cnt >= 0
 
 
 # ---------------------------------------------------------------------------
-# Lambda monotonicity: higher lambda → fewer bits
+# Lambda monotonicity: higher lambda -> fewer bits
 # ---------------------------------------------------------------------------
 
 class TestLambdaMonotonicity:
@@ -217,11 +198,7 @@ class TestLambdaMonotonicity:
             a = _pick_formats(rd, lam, FORMATS)
             bits_list.append(_total_bits(rd, a))
         for i in range(len(bits_list) - 1):
-            assert bits_list[i] >= bits_list[i + 1] - 1e-6, (
-                f"total_bits not non-increasing in lambda: "
-                f"lam={lambdas[i]} → {bits_list[i]:.1f}, "
-                f"lam={lambdas[i+1]} → {bits_list[i+1]:.1f}"
-            )
+            assert bits_list[i] >= bits_list[i + 1] - 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -232,14 +209,14 @@ class TestAllocationResultFields:
     def test_all_channels_assigned(self):
         n_out = 16
         rd = _rd_table(n_out, 64)
-        result = allocate(rd, 6.0, FORMATS, 64)
+        result = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
         assert len(result.assignments) == n_out
 
     def test_assignments_valid_formats(self):
         rd = _rd_table(16, 64)
-        result = allocate(rd, 6.0, FORMATS, 64)
+        result = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
         for j, fmt in result.assignments.items():
-            assert fmt in FORMATS, f"Channel {j} assigned unknown format {fmt}"
+            assert fmt in FORMATS
 
     def test_avg_bits_nonnegative(self):
         rd = _rd_table(16, 64)
@@ -289,21 +266,21 @@ class TestAllocationResultFields:
 class TestAllocateLayer:
     def test_returns_allocation_result(self):
         w = _rand_weight(16, 64)
-        result = allocate_layer(w, 6.0)
+        result = allocate_layer(w, 6.0, align_groups=False)
         assert isinstance(result, AllocationResult)
 
     def test_shape_consistency(self):
         n_out, n_in = 16, 64
         w = _rand_weight(n_out, n_in)
-        result = allocate_layer(w, 6.0)
+        result = allocate_layer(w, 6.0, align_groups=False)
         assert result.permutation.shape == (n_out,)
         assert result.inv_permutation.shape == (n_out,)
         assert len(result.assignments) == n_out
 
-    @pytest.mark.parametrize("budget", [4.5, 6.0, 10.0])
+    @pytest.mark.parametrize("budget", [4.5, 6.0, 8.0])
     def test_budget_satisfaction(self, budget):
         w = _rand_weight(32, 128)
-        result = allocate_layer(w, budget)
+        result = allocate_layer(w, budget, align_groups=False)
         assert abs(result.avg_bits - budget) <= 0.5
 
 
@@ -314,32 +291,30 @@ class TestAllocateLayer:
 class TestSweepBudgets:
     def test_returns_list_of_correct_length(self):
         w = _rand_weight(16, 64)
-        budgets = [4.0, 6.0, 8.0, 12.0, 16.0]
-        results = sweep_budgets(w, budgets)
+        budgets = [4.0, 6.0, 8.0]
+        results = sweep_budgets(w, budgets, align_groups=False)
         assert len(results) == len(budgets)
 
     def test_all_results_are_allocation_result(self):
         w = _rand_weight(16, 64)
-        results = sweep_budgets(w, [4.0, 8.0, 16.0])
+        results = sweep_budgets(w, [4.0, 6.0, 8.0], align_groups=False)
         for r in results:
             assert isinstance(r, AllocationResult)
 
     def test_distortion_monotone_over_budgets(self):
         w = _rand_weight(16, 64)
-        budgets = [4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0]
-        results = sweep_budgets(w, budgets)
+        budgets = [4.0, 5.0, 6.0, 7.0, 8.0]
+        results = sweep_budgets(w, budgets, align_groups=False)
         for i in range(len(results) - 1):
             assert results[i].total_distortion >= results[i + 1].total_distortion - 1e-12
 
     def test_extreme_budgets(self):
         w = _rand_weight(16, 64)
-        results = sweep_budgets(w, [4.0, 16.0])
-        # budget=4 → all NVFP4
+        results = sweep_budgets(w, [4.0, 8.0], align_groups=False)
         for fmt in results[0].assignments.values():
-            assert fmt == "NVFP4"
-        # budget=16 → all FP16
+            assert fmt == "MXFP4"
         for fmt in results[1].assignments.values():
-            assert fmt == "FP16"
+            assert fmt == "MXFP8"
 
 
 # ---------------------------------------------------------------------------
@@ -347,9 +322,8 @@ class TestSweepBudgets:
 # ---------------------------------------------------------------------------
 
 def test_infer_n_elements_per_channel():
-    """allocate() should infer n_in from rd_table when not provided."""
     rd = _rd_table(8, 64)
-    result = allocate(rd, 6.0, FORMATS)  # no n_elements_per_channel kwarg
+    result = allocate(rd, 6.0, FORMATS, align_groups=False)
     assert isinstance(result, AllocationResult)
     assert result.avg_bits > 0
 
@@ -360,21 +334,19 @@ def test_infer_n_elements_per_channel():
 
 class TestFormatSubset:
     def test_two_format_subset(self):
-        """With only NVFP4 and FP16, budget=4 → all NVFP4, budget=16 → all FP16."""
         rd = _rd_table(8, 64)
-        r4 = allocate(rd, 4.0, ["NVFP4", "FP16"], 64)
-        r16 = allocate(rd, 16.0, ["NVFP4", "FP16"], 64)
+        r4 = allocate(rd, 4.0, ["MXFP4", "MXFP8"], 64, align_groups=False)
+        r8 = allocate(rd, 8.0, ["MXFP4", "MXFP8"], 64, align_groups=False)
         for fmt in r4.assignments.values():
-            assert fmt == "NVFP4"
-        for fmt in r16.assignments.values():
-            assert fmt == "FP16"
+            assert fmt == "MXFP4"
+        for fmt in r8.assignments.values():
+            assert fmt == "MXFP8"
 
     def test_single_format(self):
-        """With only one format, all channels get that format regardless of budget."""
         rd = _rd_table(8, 64)
-        result = allocate(rd, 7.0, ["MXFP8"], 64)
+        result = allocate(rd, 6.0, ["MXFP6"], 64, align_groups=False)
         for fmt in result.assignments.values():
-            assert fmt == "MXFP8"
+            assert fmt == "MXFP6"
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +355,88 @@ class TestFormatSubset:
 
 def test_determinism():
     rd = _rd_table(16, 64)
-    r1 = allocate(rd, 6.0, FORMATS, 64)
-    r2 = allocate(rd, 6.0, FORMATS, 64)
+    r1 = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
+    r2 = allocate(rd, 6.0, FORMATS, 64, align_groups=False)
     assert r1.assignments == r2.assignments
     assert abs(r1.avg_bits - r2.avg_bits) < 1e-12
     assert abs(r1.lambda_star - r2.lambda_star) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Group alignment (128-channel)
+# ---------------------------------------------------------------------------
+
+class TestGroupAlignment:
+    def test_alignment_constant(self):
+        assert _GROUP_ALIGNMENT == 128
+
+    def test_aligned_groups_are_multiples_of_128(self):
+        """When align_groups=True and n_out is large enough, each group should be
+        a multiple of 128 (or zero)."""
+        # Use 256 channels = 2 * 128
+        w = _rand_weight(256, 64, seed=0)
+        result = allocate_layer(w, 6.0, align_groups=True)
+        for fmt, n_ch in result.splits.items():
+            if n_ch > 0:
+                assert n_ch % 128 == 0, (
+                    f"Format {fmt}: {n_ch} channels not aligned to 128"
+                )
+
+    def test_aligned_splits_sum(self):
+        w = _rand_weight(256, 64, seed=0)
+        result = allocate_layer(w, 6.0, align_groups=True)
+        total = sum(result.splits.values())
+        assert total == 256
+
+    def test_alignment_with_small_matrix_skipped(self):
+        """For matrices smaller than 128, alignment should not crash."""
+        w = _rand_weight(16, 64)
+        result = allocate_layer(w, 6.0, align_groups=True)
+        assert isinstance(result, AllocationResult)
+        assert sum(result.splits.values()) == 16
+
+    def test_alignment_preserves_permutation_validity(self):
+        """Permutation should still be valid after alignment."""
+        w = _rand_weight(256, 64, seed=0)
+        result = allocate_layer(w, 6.0, align_groups=True)
+        perm = result.permutation
+        inv = result.inv_permutation
+        assert torch.equal(inv[perm], torch.arange(256))
+
+    def test_align_groups_function_direct(self):
+        """Direct test of _align_groups."""
+        # Create assignments with non-aligned groups
+        assignments = {i: "MXFP4" for i in range(200)}
+        for i in range(200, 256):
+            assignments[i] = "MXFP8"
+        rd = _rd_table(256, 64, seed=0)
+        aligned = _align_groups(assignments, rd, FORMATS)
+        # Count per format
+        counts = {}
+        for fmt in aligned.values():
+            counts[fmt] = counts.get(fmt, 0) + 1
+        for fmt, cnt in counts.items():
+            if cnt > 0:
+                assert cnt % 128 == 0 or len(aligned) < 128, (
+                    f"Format {fmt}: {cnt} channels not aligned"
+                )
+
+    def test_align_groups_no_change_when_already_aligned(self):
+        """If groups are already aligned, should not change assignments."""
+        assignments = {i: "MXFP4" for i in range(128)}
+        for i in range(128, 256):
+            assignments[i] = "MXFP8"
+        rd = _rd_table(256, 64, seed=0)
+        aligned = _align_groups(assignments, rd, FORMATS)
+        counts = {}
+        for fmt in aligned.values():
+            counts[fmt] = counts.get(fmt, 0) + 1
+        assert counts.get("MXFP4", 0) == 128
+        assert counts.get("MXFP8", 0) == 128
+
+    def test_alignment_disabled(self):
+        """align_groups=False should skip alignment."""
+        w = _rand_weight(256, 64, seed=0)
+        result = allocate_layer(w, 6.0, align_groups=False)
+        # Don't require alignment
+        assert isinstance(result, AllocationResult)

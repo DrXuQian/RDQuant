@@ -3,17 +3,13 @@ Mixed-precision linear operators for RDQuant.
 
 Execution backends:
 
-  - ``pytorch``:  Pure PyTorch.  Dequant each format group → ``F.linear`` →
-    concat → inv-permute.  Correct on any device, used for validation.
+  - ``pytorch``:  Pure PyTorch.  Dequant each format group -> ``F.linear`` ->
+    concat -> inv-permute.  Correct on any device, used for validation.
 
-  - ``vllm`` (Step 2, future):  Drop-in replacement using vLLM's native
+  - ``vllm`` (future):  Drop-in replacement using vLLM's native
     Tensor-Core kernels on Blackwell:
-        NVFP4 → torch.ops._C.nvfp4_gemm
-        MXFP8 → torch.ops._C.cutlass_scaled_mm
-        FP16  → F.linear
-
-  - ``fused`` (Step 4, optional):  Single grouped-GEMM kernel if multi-launch
-    overhead is significant.
+        MXFP8 x MXFPx GEMM per group
+        Activations quantized to MXFP8 before each GEMM
 
 All backends produce identical results (up to floating-point ordering).
 """
@@ -25,51 +21,61 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from rdquant.core.formats import dequantize, QuantizedTensor
+from rdquant.core.formats import dequantize, MXQuantizedTensor
+from rdquant.core.act_quant import quantize_activation_mxfp8, dequantize_activation_mxfp8
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Backend: pure-PyTorch (Step 1)
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+#  Backend: pure-PyTorch
+# --------------------------------------------------------------------------
 
 def mixed_precision_linear(
     x: torch.Tensor,
-    qtensors: dict[str, QuantizedTensor],
+    qtensors: dict[str, MXQuantizedTensor],
     splits: dict[str, int],
     inv_perm: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    quantize_activation: bool = True,
 ) -> torch.Tensor:
-    """Mixed-precision linear: per-format dequant → GEMM → concat → permute.
+    """Mixed-precision linear: per-format dequant -> GEMM -> concat -> permute.
 
-    Instead of dequantizing the entire weight matrix and running one big GEMM,
-    this performs one smaller GEMM per format group and concatenates the partial
-    outputs.  Mathematically identical, but structured so each GEMM can be
-    swapped for a native kernel in Step 2.
+    Optionally applies MXFP8 activation quantization before the GEMMs.
 
     Args:
         x: Input activations ``[..., in_features]``.
-        qtensors: Format-name → QuantizedTensor for each group's weights,
+        qtensors: Format-name -> MXQuantizedTensor for each group's weights,
             stored as ``[n_channels, in_features]`` (via ``original_shape``).
-        splits: Format-name → number of output channels in that group.
+        splits: Format-name -> number of output channels in that group.
         inv_perm: ``[out_features]`` inverse-permutation to restore original
             channel order after concatenation.
         bias: Optional bias ``[out_features]`` in original channel order.
+        quantize_activation: If True, apply MXFP8 quantize->dequantize on
+            activations before the GEMMs. Default True.
 
     Returns:
         ``[..., out_features]`` output tensor.
     """
+    if quantize_activation:
+        # Straight-through estimator: quantize-dequantize the activation values
+        # but allow gradients to flow through unchanged.
+        with torch.no_grad():
+            x_codes, x_scales = quantize_activation_mxfp8(x)
+            x_hat = dequantize_activation_mxfp8(x_codes, x_scales, x.shape).to(x.dtype)
+        # Straight-through: forward uses quantized values, backward passes gradient through
+        x = x + (x_hat - x).detach()
+
     parts: list[torch.Tensor] = []
 
     for fmt, qt in qtensors.items():
         n_ch = splits[fmt]
         if n_ch == 0:
             continue
-        # Dequantize this group's weight block  →  [n_ch, in_features]
+        # Dequantize this group's weight block  ->  [n_ch, in_features]
         w_group = dequantize(qt).to(x.dtype)
-        # GEMM for this group  →  [..., n_ch]
+        # GEMM for this group  ->  [..., n_ch]
         parts.append(F.linear(x, w_group))
 
-    # Concat along output dim (permuted order) → [..., out_features]
+    # Concat along output dim (permuted order) -> [..., out_features]
     y_permuted = torch.cat(parts, dim=-1)
 
     # Restore original channel order (clone inv_perm to escape inference_mode
@@ -82,28 +88,27 @@ def mixed_precision_linear(
     return y
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Backend: vLLM native kernels (Step 2 — stub)
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+#  Backend: vLLM native kernels (stub)
+# --------------------------------------------------------------------------
 
 def mixed_precision_linear_vllm(
     x: torch.Tensor,
-    qtensors: dict[str, QuantizedTensor],
+    qtensors: dict[str, MXQuantizedTensor],
     splits: dict[str, int],
     inv_perm: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    quantize_activation: bool = True,
 ) -> torch.Tensor:
     """Same interface as :func:`mixed_precision_linear`, but uses vLLM's
     native CUDA kernels.  Requires Blackwell GPU + vLLM installed.
 
     Kernel mapping::
 
-        NVFP4 → torch.ops._C.nvfp4_gemm(x, w_packed, scales, global_scale)
-        MXFP8 → torch.ops._C.cutlass_scaled_mm(x_fp8, w_fp8.T, ...)
-        FP16  → F.linear(x, w_fp16)
+        MXFP8 activation quantization applied once
+        MXFP8 x MXFPx GEMM per format group
 
     Falls back to :func:`mixed_precision_linear` if vLLM is not available.
     """
     # TODO: implement when vLLM kernels are available
-    # For now, fall back to pure-PyTorch path
-    return mixed_precision_linear(x, qtensors, splits, inv_perm, bias)
+    return mixed_precision_linear(x, qtensors, splits, inv_perm, bias, quantize_activation)

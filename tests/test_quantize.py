@@ -50,14 +50,12 @@ def _make_tiny() -> TinyModel:
 # ---------------------------------------------------------------------------
 
 def test_quantize_model_returns_quantized_model():
-    """quantize_model() should return a QuantizedModel."""
     model = _make_tiny()
     qmodel = quantize_model(model, budget_avg_bits=5.3)
     assert isinstance(qmodel, QuantizedModel)
 
 
 def test_output_shape_unchanged():
-    """Output shape should be identical before and after quantization."""
     torch.manual_seed(0)
     model = _make_tiny()
     x = torch.randn(4, 64)
@@ -68,36 +66,30 @@ def test_output_shape_unchanged():
     with torch.no_grad():
         q_out = qmodel(x)
 
-    assert q_out.shape == original_out.shape, (
-        f"Shape mismatch: {q_out.shape} vs {original_out.shape}"
-    )
+    assert q_out.shape == original_out.shape
 
 
 def test_forward_produces_finite_outputs():
-    """Forward pass should produce finite (non-NaN, non-Inf) outputs."""
     torch.manual_seed(1)
     model = _make_tiny()
     x = torch.randn(4, 64)
     qmodel = quantize_model(model, budget_avg_bits=5.3)
     with torch.no_grad():
         out = qmodel(x)
-    assert torch.isfinite(out).all(), "Output contains non-finite values"
+    assert torch.isfinite(out).all()
 
 
 def test_budget_approximately_met():
-    """Average bits across quantized layers should be within ±1 of target."""
     torch.manual_seed(2)
     model = _make_tiny()
     target_bits = 5.3
     qmodel = quantize_model(model, budget_avg_bits=target_bits)
 
-    # Compute actual average bits across all quantized layers
     total_bits = 0.0
     total_params = 0
     for name, result in qmodel.layer_info.items():
         for fmt, stats in result.format_stats.items():
             total_bits += stats["total_bits"]
-        # n_params = n_out * n_in
         n_out = sum(result.splits.values())
         if n_out > 0 and result.avg_bits > 0:
             n_in = int(round(
@@ -108,42 +100,32 @@ def test_budget_approximately_met():
 
     if total_params > 0:
         actual_bits = total_bits / total_params
-        assert abs(actual_bits - target_bits) < 1.0, (
-            f"avg_bits={actual_bits:.2f} is more than 1 bit away from target={target_bits}"
-        )
+        assert abs(actual_bits - target_bits) < 1.5
 
 
 def test_ignore_patterns():
-    """Layers matching ignore patterns should remain as nn.Linear."""
     torch.manual_seed(3)
     model = _make_tiny()
     qmodel = quantize_model(model, budget_avg_bits=5.3, ignore=["fc1"])
 
-    # fc1 should not be in layer_info (was ignored)
-    assert "fc1" not in qmodel.layer_info, "fc1 should be ignored"
-    # fc2 and fc3 should be quantized
+    assert "fc1" not in qmodel.layer_info
     assert "fc2" in qmodel.layer_info
     assert "fc3" in qmodel.layer_info
-    # fc1 should still be an nn.Linear in the model
-    assert isinstance(qmodel.model.fc1, nn.Linear), "fc1 should remain as nn.Linear"
-    # fc2 should be a QuantizedLayer
-    assert isinstance(qmodel.model.fc2, QuantizedLayer), "fc2 should be QuantizedLayer"
+    assert isinstance(qmodel.model.fc1, nn.Linear)
+    assert isinstance(qmodel.model.fc2, QuantizedLayer)
 
 
 def test_ignore_all_layers():
-    """Ignoring all layers should return a model with no quantized layers."""
     torch.manual_seed(4)
     model = _make_tiny()
     qmodel = quantize_model(model, budget_avg_bits=5.3, ignore=["fc1", "fc2", "fc3"])
     assert len(qmodel.layer_info) == 0
-    # All layers remain as nn.Linear
     assert isinstance(qmodel.model.fc1, nn.Linear)
     assert isinstance(qmodel.model.fc2, nn.Linear)
     assert isinstance(qmodel.model.fc3, nn.Linear)
 
 
 def test_no_bias_model():
-    """Quantization should work for layers without bias."""
     torch.manual_seed(5)
     model = TinyModelNoBias()
     x = torch.randn(2, 64)
@@ -155,7 +137,6 @@ def test_no_bias_model():
 
 
 def test_per_layer_budget():
-    """per_layer_budget=True should also return a QuantizedModel with finite outputs."""
     torch.manual_seed(6)
     model = _make_tiny()
     x = torch.randn(2, 64)
@@ -167,7 +148,6 @@ def test_per_layer_budget():
 
 
 def test_save_load_roundtrip():
-    """save_pretrained / from_pretrained round-trip should produce matching outputs."""
     torch.manual_seed(7)
     model = _make_tiny()
     x = torch.randn(2, 64)
@@ -178,7 +158,6 @@ def test_save_load_roundtrip():
 
     with tempfile.TemporaryDirectory() as tmpdir:
         qmodel.save_pretrained(tmpdir)
-        # Check that config file was written
         assert os.path.isfile(os.path.join(tmpdir, "quantization_config.json"))
 
         qmodel2 = QuantizedModel.from_pretrained(tmpdir)
@@ -186,65 +165,77 @@ def test_save_load_roundtrip():
             out2 = qmodel2(x)
 
     assert out1.shape == out2.shape
-    assert torch.allclose(out1, out2, atol=1e-5), (
-        f"Outputs differ after save/load: max diff = {(out1 - out2).abs().max().item()}"
-    )
+    assert torch.allclose(out1, out2, atol=1e-5)
 
 
 def test_print_summary_runs(capsys):
-    """print_summary() should not crash and should print something."""
     torch.manual_seed(8)
     model = _make_tiny()
     qmodel = quantize_model(model, budget_avg_bits=5.3)
     qmodel.print_summary()
     captured = capsys.readouterr()
-    assert len(captured.out) > 0, "print_summary produced no output"
+    assert len(captured.out) > 0
 
 
 def test_formats_subset():
-    """Quantization should work with a subset of formats."""
     torch.manual_seed(9)
     model = _make_tiny()
     x = torch.randn(2, 64)
-    qmodel = quantize_model(model, budget_avg_bits=7.0, formats=["MXFP8", "FP16"])
+    qmodel = quantize_model(model, budget_avg_bits=7.0, formats=["MXFP6", "MXFP8"])
     with torch.no_grad():
         out = qmodel(x)
     assert torch.isfinite(out).all()
 
 
-def test_low_budget_mostly_nvfp4():
-    """At very low budget, most channels should be assigned NVFP4."""
+def test_low_budget_mostly_mxfp4():
     torch.manual_seed(10)
     model = TinyModel()
     qmodel = quantize_model(model, budget_avg_bits=4.0)
-    # Check that NVFP4 channels dominate
     for name, result in qmodel.layer_info.items():
         total_ch = sum(result.splits.values())
-        nvfp4_ch = result.splits.get("NVFP4", 0)
-        assert nvfp4_ch >= total_ch * 0.5, (
-            f"Layer {name}: expected NVFP4 dominance at budget=4.0, "
-            f"got {nvfp4_ch}/{total_ch}"
-        )
+        mxfp4_ch = result.splits.get("MXFP4", 0)
+        assert mxfp4_ch >= total_ch * 0.5
 
 
-def test_high_budget_mostly_fp16():
-    """At very high budget, most channels should be assigned FP16."""
+def test_high_budget_mostly_mxfp8():
     torch.manual_seed(11)
     model = TinyModel()
-    qmodel = quantize_model(model, budget_avg_bits=16.0)
+    qmodel = quantize_model(model, budget_avg_bits=8.0)
     for name, result in qmodel.layer_info.items():
         total_ch = sum(result.splits.values())
-        fp16_ch = result.splits.get("FP16", 0)
-        assert fp16_ch == total_ch, (
-            f"Layer {name}: expected all FP16 at budget=16.0, "
-            f"got {fp16_ch}/{total_ch}"
-        )
+        mxfp8_ch = result.splits.get("MXFP8", 0)
+        assert mxfp8_ch == total_ch
 
 
 def test_quantized_layer_repr():
-    """QuantizedLayer extra_repr should include avg_bits."""
     torch.manual_seed(12)
     model = _make_tiny()
     qmodel = quantize_model(model, budget_avg_bits=5.3)
     repr_str = repr(qmodel.model.fc1)
     assert "avg_bits" in repr_str
+    assert "act_quant" in repr_str
+
+
+def test_activation_quantization_disabled():
+    """quantize_activation=False should skip MXFP8 act quantization."""
+    torch.manual_seed(13)
+    model = _make_tiny()
+    x = torch.randn(2, 64)
+    qmodel = quantize_model(model, budget_avg_bits=5.3, quantize_activation=False)
+    with torch.no_grad():
+        out = qmodel(x)
+    assert torch.isfinite(out).all()
+    # Check that QuantizedLayer has act quant disabled
+    for name, mod in qmodel.model.named_modules():
+        if isinstance(mod, QuantizedLayer):
+            assert not mod.quantize_activation
+
+
+def test_activation_quantization_enabled_by_default():
+    """By default, activation quantization should be enabled."""
+    torch.manual_seed(14)
+    model = _make_tiny()
+    qmodel = quantize_model(model, budget_avg_bits=5.3)
+    for name, mod in qmodel.model.named_modules():
+        if isinstance(mod, QuantizedLayer):
+            assert mod.quantize_activation

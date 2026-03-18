@@ -31,8 +31,8 @@ def parse_args() -> argparse.Namespace:
         "--formats",
         type=str,
         nargs="+",
-        default=["NVFP4", "MXFP6", "MXFP8", "FP16"],
-        help="Allowed quantization formats.",
+        default=["MXFP4", "MXFP6", "MXFP8"],
+        help="Allowed quantization formats (MX-only).",
     )
     parser.add_argument(
         "--device",
@@ -83,7 +83,6 @@ def main() -> None:
     results_table = []
 
     for budget in args.budgets:
-        # Deep copy the original model weights each time (quantize_model modifies in place)
         model_copy = copy.deepcopy(base_model)
         qmodel = quantize_model(
             model_copy,
@@ -91,7 +90,6 @@ def main() -> None:
             formats=args.formats,
         )
 
-        # Compute overall avg bits and total distortion
         total_bits = 0.0
         total_params = 0
         total_distortion = 0.0
@@ -141,7 +139,7 @@ def main() -> None:
             axes[0].set_title("Rate-Distortion Curve")
             axes[0].grid(True, alpha=0.3)
 
-            if args.eval and any(r["ppl"] == r["ppl"] for r in results_table):  # any non-NaN
+            if args.eval and any(r["ppl"] == r["ppl"] for r in results_table):
                 import math
                 ppl_vals = [r["ppl"] for r in results_table if math.isfinite(r["ppl"])]
                 bits_for_ppl = [r["actual_bits"] for r in results_table if math.isfinite(r["ppl"])]
