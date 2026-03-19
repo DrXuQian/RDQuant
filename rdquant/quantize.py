@@ -104,7 +104,11 @@ class QuantizedLayer(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Mixed-precision forward: per-format dequant -> GEMM -> concat -> permute.
+        """Mixed-precision forward: per-format GEMM -> concat -> permute.
+
+        Automatically uses vLLM native kernels (marlin_gemm for NVFP4,
+        cutlass_scaled_mm for FP8) when available.  Falls back to
+        dequant + F.linear on CPU or when vLLM is not installed.
 
         Args:
             x: Input tensor of shape [..., in_features].
@@ -112,12 +116,18 @@ class QuantizedLayer(nn.Module):
         Returns:
             Output tensor of shape [..., out_features].
         """
-        from rdquant.ops import mixed_precision_linear
+        from rdquant.ops import mixed_precision_linear_vllm, _check_vllm
 
         qw = self.quantized_weight
-        return mixed_precision_linear(
-            x, qw.qtensors, qw.splits, qw.inv_permutation, self.bias,
-        )
+        if x.is_cuda and _check_vllm():
+            return mixed_precision_linear_vllm(
+                x, qw.qtensors, qw.splits, qw.inv_permutation, self.bias,
+            )
+        else:
+            from rdquant.ops import mixed_precision_linear
+            return mixed_precision_linear(
+                x, qw.qtensors, qw.splits, qw.inv_permutation, self.bias,
+            )
 
     def extra_repr(self) -> str:
         return (
