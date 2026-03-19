@@ -139,13 +139,14 @@ RTX 5090 has 170 SMs. At M=1, each sub-GEMM only uses ~13+7=20 tiles, well withi
 
 | Method | PPL | bpw | Weight size | Decode speedup |
 |---|---:|---:|---:|---:|
-| FP16 baseline | 13.16 | 16.00 | 100% | 1.0x |
-| RDQuant calibrated | 12.57 | 5.19 | 32% | ~2.8x |
-| RDQuant data-free | 13.18 | 5.32 | 34% | ~2.8x |
-| Uniform NVFP4 | 13.27 | 4.00 | 28% | ~3.6x |
-| Uniform FP8 | 13.28 | 8.15 | 50% | ~2.0x |
+| BF16 baseline | 12.90 | 16.00 | 100% | 1.0x |
+| RDQuant calibrated | 12.24 | 5.29 | 33% | ~2.8x |
+| Uniform FP8 | 12.93 | 8.13 | 50% | ~2.0x |
+| Uniform NVFP4 | 13.22 | 4.00 | 28% | ~3.6x |
+| RDQuant data-free | 13.43 | 5.52 | 34% | ~2.8x |
 
-RDQuant calibrated achieves the best PPL (12.57, better than FP16) at 2.8x decode speedup and 3x model compression.
+Results on original BF16 Qwen3-4B weights (not dequanted from NVFP4 checkpoint).
+RDQuant calibrated achieves the best PPL (12.24, -0.66 vs BF16) at 2.8x decode speedup and 3x model compression.
 
 ---
 

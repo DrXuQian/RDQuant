@@ -12,21 +12,22 @@ Two allocation modes:
 
 ## Results
 
-WikiText-2 perplexity on **Qwen3-4B** (stride 2048, 32k tokens):
+WikiText-2 perplexity on **Qwen3-4B** original BF16 weights (stride 2048, 32k tokens):
 
 | Method | Avg Bits | PPL | vs BF16 |
 |---|---:|---:|---:|
-| **RDQuant calibrated** | **5.19** | **12.57** | **-0.59** |
-| BF16 baseline | 16.00 | 13.16 | — |
-| RDQuant data-free | 5.32 | 13.18 | +0.02 |
-| Uniform NVFP4 | 4.00 | 13.27 | +0.11 |
-| Uniform FP8 | 8.15 | 13.28 | +0.12 |
+| **RDQuant calibrated** | **5.29** | **12.24** | **-0.66** |
+| BF16 baseline | 16.00 | 12.90 | — |
+| Uniform FP8 | 8.13 | 12.93 | +0.03 |
+| Uniform NVFP4 | 4.00 | 13.22 | +0.32 |
+| RDQuant data-free | 5.52 | 13.43 | +0.53 |
 
 Key findings:
-- **Calibrated RDQuant at 5.19 bpw beats BF16** (12.57 vs 13.16 PPL) — quantization acts as regularization
-- **Data-free RDQuant at 5.32 bpw is near-lossless** (+0.02 PPL vs BF16) at 3x compression
-- **Uniform NVFP4 at 4 bpw is near-lossless** (+0.11 PPL) — NVFP4's per-16 FP8 block scale is highly accurate
+- **Calibrated RDQuant at 5.29 bpw beats BF16** (12.24 vs 12.90 PPL) — quantization acts as regularization
+- **Uniform NVFP4 at 4 bpw** adds only +0.32 PPL — NVFP4's per-16 FP8 block scale is highly accurate
+- **Uniform FP8 at 8 bpw is near-lossless** (+0.03 PPL)
 - Format split at 5.3 bpw: 57% NVFP4 + 43% FP8 (data-free) or 67% NVFP4 + 32% FP8 + 1% FP16 (calibrated)
+- Calibrated allocation uses perturb-based layer importance (quantize each layer to NVFP4 one-by-one, measure loss delta)
 
 ---
 
