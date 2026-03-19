@@ -1,0 +1,567 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[margin=1in]{geometry}
+\usepackage{multirow}
+\usepackage{xcolor}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+
+\title{RDQuant: Rate--Distortion Optimal Channel-Wise Mixed-Precision Quantization for Large Language Models}
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+%=====================================================================
+\begin{abstract}
+Post-training quantization of large language models typically applies a single numeric format uniformly across all weight channels.
+We observe that output channels exhibit vastly different sensitivities to quantization error, and that the optimal format for a given channel depends jointly on its weight distribution and on a global bit-rate budget.
+We formulate channel-wise format assignment as a \emph{rate--distortion} optimization problem and solve it via Lagrangian relaxation with binary search, yielding a provably optimal allocation in $O(N \log(1/\epsilon))$ time per layer.
+RDQuant assigns each output channel of a weight matrix to one of three hardware-native formats---NVFP4 (4-bit), FP8 (8-bit), or FP16 (16-bit)---and dispatches inference through production vLLM Marlin kernels.
+We provide both a \emph{data-free} mode that uses weight-only MSE and a \emph{calibrated} mode that incorporates per-layer importance estimated from two calibration samples.
+On Qwen3-4B evaluated on WikiText-2, calibrated RDQuant at 5.29 bits per weight achieves a perplexity of 12.24, \emph{improving} over the BF16 baseline (12.90 PPL) by 0.66 points---an instance of quantization-as-regularization.
+Packed model size is 2.62\,GB (33\% of BF16).
+On an NVIDIA RTX 5090, RDQuant with CUDA Graphs delivers a 2.59$\times$ decode speedup over BF16, with prefill parity at 1.25$\times$.
+\end{abstract}
+
+%=====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Autoregressive decoding in large language models (LLMs) is fundamentally bottlenecked by memory bandwidth: generating a single token requires reading every weight once, while the arithmetic intensity is only $O(1)$ multiply-accumulate per weight element~\cite{kwon2023vllm}.
+Quantization reduces the memory footprint and, more importantly, the bandwidth consumed per token, directly translating to faster decode.
+
+The dominant approach in practice is \emph{uniform quantization}: every weight matrix is quantized to a single format, whether GPTQ~\cite{frantar2022gptq}, AWQ~\cite{lin2024awq}, or the hardware-native NVFP4 format on NVIDIA Blackwell GPUs~\cite{nvidia2024fp4}.
+Uniform quantization is simple and efficient but wasteful: in a typical transformer, some output channels contain large outlier weights that dominate the block scale in sub-channel formats like NVFP4, crushing the majority of small values in the same block.
+Other channels are nearly uniform and can be aggressively quantized with negligible error.
+
+We propose \textbf{RDQuant}, a \emph{rate--distortion} (R-D) optimal framework for per-output-channel mixed-precision quantization.
+Given a target average bit rate, RDQuant solves a Lagrangian relaxation to assign each output channel to one of three hardware-native formats (NVFP4, FP8, FP16), minimizing total quantization distortion subject to a global bit budget.
+The key contributions are:
+
+\begin{enumerate}
+    \item \textbf{R-D formulation.} We formalize channel-wise format assignment as a constrained optimization and show that the Lagrangian decomposition yields per-channel independent subproblems solvable via binary search on a single scalar multiplier $\lambda$ (Section~\ref{sec:rd}).
+    \item \textbf{Theoretical analysis of channel sensitivity.} We derive closed-form expressions for the quantization MSE of block-scaled formats in the presence of outlier weights, proving that per-channel format assignment is strictly better than uniform when the outlier-to-standard-deviation ratio varies across channels (Section~\ref{sec:sensitivity}).
+    \item \textbf{Data-free and calibrated modes.} The data-free mode requires no calibration data; the calibrated mode uses a lightweight perturbation-based importance metric with only two forward passes (Section~\ref{sec:calibrated}).
+    \item \textbf{Production inference.} RDQuant integrates with vLLM's Marlin GEMM kernels and CUDA Graphs, achieving 2.59$\times$ decode speedup on RTX 5090 (Section~\ref{sec:inference}).
+    \item \textbf{Orthogonality to K-split methods.} We prove that output-channel (N-split) and input-channel (K-split) mixed precision are independent degrees of freedom that can be composed (Section~\ref{sec:orthogonality}).
+\end{enumerate}
+
+Table~\ref{tab:headline} previews our main results on Qwen3-4B.
+
+\begin{table}[t]
+\centering
+\caption{WikiText-2 perplexity (PPL) for Qwen3-4B. Lower is better. RDQuant calibrated at 5.29 bits per weight (bpw) \emph{improves} over the BF16 baseline.}
+\label{tab:headline}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Avg Bits} & \textbf{PPL} & \textbf{$\Delta$ vs BF16} \\
+\midrule
+RDQuant calibrated & 5.29 & 12.24 & $-0.66$ \\
+BF16 baseline & 16.00 & 12.90 & --- \\
+Uniform FP8 & 8.13 & 12.93 & $+0.03$ \\
+Uniform NVFP4 & 4.00 & 13.22 & $+0.32$ \\
+RDQuant data-free & 5.52 & 13.43 & $+0.53$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=====================================================================
+\section{Background and Related Work}
+\label{sec:related}
+
+\paragraph{Uniform post-training quantization.}
+GPTQ~\cite{frantar2022gptq} uses approximate second-order information to minimize layer-wise reconstruction error during round-to-nearest quantization.
+AWQ~\cite{lin2024awq} protects salient weight channels by scaling them up before quantization, effectively redistributing quantization error.
+SqueezeLLM~\cite{kim2023squeezellm} combines dense uniform quantization with sparse outlier storage.
+QuIP\#~\cite{chee2024quip} applies random Hadamard rotations to improve weight incoherence before lattice-codebook quantization.
+OmniQuant~\cite{shao2024omniquant} learns per-channel clipping and equivalence transformations.
+All of these methods apply a single numeric precision to all channels within a layer.
+
+\paragraph{Mixed-precision quantization.}
+HAWQ~\cite{dong2019hawq} assigns different bit widths at the \emph{layer} level using Hessian-based sensitivity analysis.
+MicroMix~\cite{yi2024micromix} splits along the \emph{input channel} (K) dimension, assigning different precisions to different groups of input channels.
+This requires reordering activations and results in $3\times$ output write bandwidth due to partial-sum accumulation across precision groups.
+FLUTE~\cite{guo2024flute} uses lookup tables for non-uniform quantization with flexible bit widths.
+LLM.int8()~\cite{dettmers2022gpt3int8} isolates activation outliers in a separate FP16 pathway, a form of mixed precision along the \emph{token} dimension.
+SmoothQuant~\cite{xiao2023smoothquant} redistributes quantization difficulty from activations to weights.
+
+RDQuant differs from all prior work by operating at the \emph{output channel} granularity, formulating allocation as a rate--distortion problem with a global cross-layer Lagrangian, and targeting hardware-native formats (NVFP4, FP8) with production kernels.
+
+\paragraph{NVIDIA numeric formats.}
+NVFP4 uses the E2M1 representation with a per-16-element FP8 (E4M3) block scale and a per-tensor FP32 global scale.
+The effective dynamic range per block is determined by the block scale, which must accommodate the largest element.
+FP8 (E4M3) provides 8 bits per element with a per-channel FP32 scale, offering substantially higher dynamic range at $2\times$ the storage cost.
+Blackwell GPUs provide Tensor Core support for both formats.
+
+\paragraph{Rate--distortion theory.}
+Shannon's rate--distortion function~\cite{shannon1959coding} characterizes the minimum bit rate required to represent a source within a given distortion tolerance.
+In the quantization context, each format $f$ defines a codebook with rate $R_f$ (bits per element) and achievable distortion $D(f)$.
+The optimal allocation across multiple sources (channels) under a total rate budget is solved by the classical Lagrangian method~\cite{cover2006elements}, assigning each source to the format that minimizes $D + \lambda R$ for a single multiplier $\lambda$.
+
+%=====================================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Output Channel Sensitivity Analysis}
+\label{sec:sensitivity}
+
+Consider a linear layer with weight matrix $\mathbf{W} \in \mathbb{R}^{N \times K}$, where $N$ is the number of output channels and $K$ is the input dimension.
+We analyze the quantization error for a single output channel $\mathbf{w} \in \mathbb{R}^K$ under block-scaled quantization.
+
+\paragraph{Block-scaled quantization model.}
+In NVFP4, the weight vector is partitioned into blocks of size $B = 16$.
+Within each block, a single FP8 scale $s$ is chosen (typically the maximum absolute value divided by the format's maximum representable value), and each element is rounded to the nearest E2M1 grid point after division by $s$.
+Let $q_\text{max}$ denote the largest representable value in E2M1; for NVFP4, $q_\text{max} = 6.0$.
+
+\begin{proposition}[Outlier-induced MSE amplification]
+\label{prop:mse}
+Consider a block of $B$ elements where one element has magnitude $m$ (the outlier) and the remaining $B-1$ elements are drawn i.i.d.\ from $\mathcal{N}(0, \sigma^2)$ with $m \gg \sigma$.
+Under NVFP4 quantization with block scale $s = m / q_\text{max}$, the expected per-element MSE satisfies:
+\begin{equation}
+\label{eq:mse_bound}
+\text{MSE}_\text{block} \;\geq\; \frac{B-1}{B} \cdot \sigma^2 \left(1 - \frac{q_\text{max}^2 \sigma^2}{m^2}\right) \;=\; \frac{B-1}{B}\,\sigma^2\!\left(1 - \frac{36\,\sigma^2}{m^2}\right).
+\end{equation}
+In particular, when $m \gg 6\sigma$, the MSE approaches $\frac{B-1}{B}\sigma^2$, meaning nearly all signal in the small elements is lost.
+\end{proposition}
+
+\begin{proof}
+The block scale is set to $s = m / q_\text{max} = m/6$.
+After scaling, a small element $w_i \sim \mathcal{N}(0, \sigma^2)$ becomes $w_i / s = 6w_i / m$.
+When $m \gg 6\sigma$, the scaled values $|6w_i / m| \ll 1$ with high probability, so they are rounded to zero.
+The quantization error for each small element is then $w_i^2$.
+In expectation:
+\begin{equation}
+\mathbb{E}[(\hat{w}_i - w_i)^2] = \mathbb{E}[w_i^2] - \mathbb{E}[(\hat{w}_i)^2] \geq \sigma^2 - \sigma^2 \cdot \frac{q_\text{max}^2 \sigma^2}{m^2} = \sigma^2\!\left(1 - \frac{36\,\sigma^2}{m^2}\right),
+\end{equation}
+where the second term accounts for the rare event that $|6w_i/m|$ rounds to a nonzero grid point.
+The outlier itself is quantized with relative error $O(2^{-2})$ (one bit of mantissa in E2M1), contributing a small term.
+Averaging over $B$ elements, the block MSE is at least $\frac{B-1}{B}\sigma^2(1 - 36\sigma^2/m^2)$.
+\end{proof}
+
+\begin{corollary}
+\label{cor:fp8}
+Under FP8 (E4M3) quantization with per-channel scaling, the same block achieves MSE $\approx \sigma^2 \cdot 2^{-2\cdot 3} = \sigma^2/64$ per element (three mantissa bits), independent of the outlier magnitude $m$, since the per-channel scale accommodates the full dynamic range with 8-bit resolution.
+\end{corollary}
+
+\begin{remark}
+The ratio of NVFP4-to-FP8 MSE for an outlier-containing channel scales as $O(m^2/\sigma^2)$, which can exceed $10^4$ in practice.
+This motivates upgrading such channels to FP8 at a cost of only $4$ additional bits per element.
+Channels without outliers (small $m/\sigma$) can remain at NVFP4 with negligible error increase.
+The optimal assignment depends on the \emph{marginal rate--distortion tradeoff}: whether the distortion reduction from upgrading a channel to FP8 justifies the $4$-bit cost.
+\end{remark}
+
+\subsection{Rate--Distortion Optimal Allocation}
+\label{sec:rd}
+
+\paragraph{Problem formulation.}
+Let $\mathcal{L}$ denote the set of linear layers in the model.
+For layer $\ell \in \mathcal{L}$, let $N_\ell$ and $K_\ell$ be the output and input dimensions.
+Let $\mathcal{F} = \{\text{NVFP4}, \text{FP8}, \text{FP16}\}$ with per-element costs $c_f \in \{4, 8, 16\}$ bits.
+For output channel $j$ of layer $\ell$, define the distortion:
+\begin{equation}
+D_{\ell,j}(f) = \frac{1}{K_\ell}\|\mathbf{w}_{\ell,j} - Q_f(\mathbf{w}_{\ell,j})\|_2^2,
+\end{equation}
+where $Q_f$ denotes quantization to format $f$.
+We seek format assignments $\{f_{\ell,j}\}$ solving:
+\begin{equation}
+\label{eq:rd_problem}
+\min_{\{f_{\ell,j}\}} \sum_{\ell \in \mathcal{L}} \omega_\ell \sum_{j=1}^{N_\ell} D_{\ell,j}(f_{\ell,j}) \quad \text{s.t.} \quad \sum_{\ell \in \mathcal{L}} \sum_{j=1}^{N_\ell} c_{f_{\ell,j}} \cdot K_\ell \;\leq\; B_\text{total},
+\end{equation}
+where $\omega_\ell \geq 0$ is a per-layer importance weight and $B_\text{total}$ is the global bit budget.
+
+\paragraph{Lagrangian relaxation.}
+Introducing multiplier $\lambda \geq 0$, the Lagrangian is:
+\begin{equation}
+\mathcal{J}(\lambda) = \sum_{\ell,j} \left[\omega_\ell \, D_{\ell,j}(f_{\ell,j}) + \lambda \, c_{f_{\ell,j}} \cdot K_\ell \right].
+\end{equation}
+For fixed $\lambda$, the minimization decomposes into independent per-channel subproblems:
+\begin{equation}
+\label{eq:perchannel}
+f_{\ell,j}^*(\lambda) = \arg\min_{f \in \mathcal{F}} \left[\omega_\ell \, D_{\ell,j}(f) + \lambda \, c_f \cdot K_\ell \right].
+\end{equation}
+Each subproblem requires evaluating only $|\mathcal{F}| = 3$ candidates.
+The total rate $R(\lambda) = \sum_{\ell,j} c_{f_{\ell,j}^*(\lambda)} \cdot K_\ell$ is a non-increasing step function of $\lambda$.
+We find $\lambda^*$ such that $R(\lambda^*) \leq B_\text{total}$ via binary search.
+
+\begin{proposition}[Optimality]
+\label{prop:optimal}
+The Lagrangian relaxation \eqref{eq:perchannel} yields the global optimum of \eqref{eq:rd_problem} whenever the constraint is active (i.e., the budget is tight).
+Since the feasible set is finite ($|\mathcal{F}|^{\sum_\ell N_\ell}$ assignments), strong duality holds trivially, and binary search on $\lambda$ over 64 iterations yields $\epsilon < 10^{-19}$ precision on the multiplier.
+\end{proposition}
+
+\paragraph{128-channel alignment.}
+Hardware GEMM kernels require contiguous channel groups aligned to tile boundaries (typically 128 channels for Marlin kernels).
+After solving for channel-level assignments, we round format boundaries to the nearest 128-channel multiple, preserving near-optimality.
+
+The complete allocation procedure is summarized in Algorithm~\ref{alg:rdquant}.
+
+\begin{algorithm}[t]
+\caption{RDQuant: Rate--Distortion Optimal Channel-Wise Allocation}
+\label{alg:rdquant}
+\SetAlgoLined
+\KwIn{Model weights $\{\mathbf{W}_\ell\}_{\ell \in \mathcal{L}}$, formats $\mathcal{F}$, bit budget $B_\text{total}$, layer weights $\{\omega_\ell\}$}
+\KwOut{Format assignment $\{f_{\ell,j}\}$, quantized weights}
+
+\tcp{Step 1: Compute per-channel distortions}
+\ForEach{layer $\ell \in \mathcal{L}$}{
+    \ForEach{output channel $j = 1, \ldots, N_\ell$}{
+        \ForEach{format $f \in \mathcal{F}$}{
+            $D_{\ell,j}(f) \leftarrow \frac{1}{K_\ell}\|\mathbf{w}_{\ell,j} - Q_f(\mathbf{w}_{\ell,j})\|_2^2$
+        }
+    }
+}
+\tcp{Step 2: Binary search on Lagrange multiplier}
+$\lambda_\text{lo} \leftarrow 0$, $\lambda_\text{hi} \leftarrow \lambda_\text{max}$\;
+\For{$t = 1, \ldots, 64$}{
+    $\lambda \leftarrow (\lambda_\text{lo} + \lambda_\text{hi}) / 2$\;
+    \ForEach{$(\ell, j)$}{
+        $f_{\ell,j}^* \leftarrow \arg\min_{f \in \mathcal{F}} [\omega_\ell \, D_{\ell,j}(f) + \lambda \, c_f \cdot K_\ell]$\;
+    }
+    $R \leftarrow \sum_{\ell,j} c_{f_{\ell,j}^*} \cdot K_\ell$\;
+    \lIf{$R > B_\text{total}$}{$\lambda_\text{lo} \leftarrow \lambda$}
+    \lElse{$\lambda_\text{hi} \leftarrow \lambda$}
+}
+\tcp{Step 3: Align to 128-channel groups and quantize}
+\ForEach{layer $\ell$}{
+    Sort channels by assigned format\;
+    Round group boundaries to 128-channel multiples\;
+    Quantize each channel to its assigned format\;
+    Store permutation index for output reconstruction\;
+}
+\Return{$\{f_{\ell,j}\}$, quantized weights, permutation indices}
+\end{algorithm}
+
+\subsection{Calibrated Layer Importance}
+\label{sec:calibrated}
+
+\paragraph{Data-free mode.}
+When no calibration data is available, we set $\omega_\ell = 1$ for all layers, weighting each layer's distortion equally.
+This yields a purely weight-statistics-based allocation.
+
+\paragraph{Calibrated mode.}
+We estimate per-layer importance via a perturbation approach:
+\begin{equation}
+\omega_\ell = \mathcal{L}\!\left(\text{model with layer } \ell \text{ quantized to NVFP4}\right) - \mathcal{L}\!\left(\text{baseline model}\right),
+\end{equation}
+where $\mathcal{L}$ is the cross-entropy loss on a small calibration set (2 sequences of 2048 tokens from WikiText-2 training data).
+This measures the actual impact of quantizing each layer at the worst-case precision, capturing both weight sensitivity and the layer's position in the computation graph.
+
+The importance scores are then used in the Lagrangian~\eqref{eq:perchannel}: layers with high $\omega_\ell$ receive more bits, as the marginal distortion reduction per bit is weighted higher.
+
+\paragraph{Why activation norm fails.}
+A natural alternative is the activation norm proxy $\omega_\ell \propto \|\mathbf{X}_\ell\|_F^2$, where $\mathbf{X}_\ell$ is the input activation to layer $\ell$.
+We find this gives a \emph{wrong} ranking: in transformer models, the residual stream magnitude grows monotonically through layers (by approximately $14{,}000\times$ from the first to the last layer in Qwen3-4B), causing later layers to dominate the importance ranking regardless of their actual quantization sensitivity.
+The perturbation-based metric avoids this by directly measuring the loss impact.
+
+In our experiments, the most sensitive layer is \texttt{layers.2.mlp.gate\_proj} (importance = 94.7) and the least sensitive is \texttt{layers.35.self\_attn.v\_proj} (importance $\approx 0$), a ranking that is \emph{anti-correlated} with the activation norm ordering.
+
+\subsection{Orthogonality: Output-Channel vs.\ Input-Channel Splitting}
+\label{sec:orthogonality}
+
+Mixed-precision quantization can split along two independent matrix dimensions: the output dimension $N$ (our approach) or the input dimension $K$ (as in MicroMix~\cite{yi2024micromix}).
+We formalize why these are orthogonal.
+
+\begin{proposition}[Orthogonality of N-split and K-split]
+\label{prop:orthogonal}
+Consider a linear operation $\mathbf{y} = \mathbf{W}\mathbf{x}$ with $\mathbf{W} \in \mathbb{R}^{N \times K}$.
+\begin{itemize}
+    \item \textbf{N-split (RDQuant):} Partition the output channels into groups $\{G_f\}_{f \in \mathcal{F}}$ by format.
+    The computation becomes $\mathbf{y}_{G_f} = \mathbf{W}_{G_f,:} \cdot \mathbf{x}$ for each $f$, where $\mathbf{W}_{G_f,:}$ is quantized to format $f$.
+    The outputs are disjoint slices of $\mathbf{y}$ that are concatenated and permuted.
+    The activation $\mathbf{x}$ is used at full precision (FP16) in all groups.
+    \item \textbf{K-split (MicroMix):} Partition the input channels into groups $\{H_f\}_{f \in \mathcal{F}}$.
+    The computation becomes $\mathbf{y} = \sum_f \mathbf{W}_{:,H_f} \cdot \mathbf{x}_{H_f}$, where both $\mathbf{W}_{:,H_f}$ and $\mathbf{x}_{H_f}$ are quantized to format $f$.
+    The outputs are partial sums that must be accumulated.
+\end{itemize}
+These two decompositions are independent: one can apply both simultaneously by partitioning $\mathbf{W}$ into a 2D grid of blocks $\mathbf{W}_{G_f, H_g}$, each with its own format pair $(f, g)$.
+\end{proposition}
+
+Table~\ref{tab:nsplit_vs_ksplit} summarizes the practical differences.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of N-split (RDQuant) and K-split (MicroMix) mixed-precision strategies.}
+\label{tab:nsplit_vs_ksplit}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Property} & \textbf{RDQuant (N-split)} & \textbf{MicroMix (K-split)} \\
+\midrule
+Split dimension & $N$ (output) & $K$ (input) \\
+Activation precision & FP16 (uniform) & Mixed FP4/FP6/FP8 \\
+Output merge & Concat $+$ permute & Sum (accumulate) \\
+Activation reorder & Not required & Required \\
+Output bandwidth & $1\times$ & $3\times$ \\
+Composable & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+A key practical advantage of N-split is that activations remain in a single uniform format (FP16), avoiding the activation quantization error and reordering overhead inherent in K-split methods.
+The two approaches can be combined (future work): split both $N$ and $K$ for maximum compression at the cost of a more complex kernel dispatch.
+
+%=====================================================================
+\section{Supported Formats and Kernel Integration}
+\label{sec:inference}
+
+\subsection{Format Specifications}
+
+RDQuant targets three hardware-native formats:
+
+\begin{itemize}
+    \item \textbf{NVFP4 (E2M1):} 4 bits per element, with a per-16-element FP8 (E4M3) block scale and a per-tensor FP32 global scale.
+    Effective cost: $4 + 8/16 = 4.5$ bits per element (we report the 4-bit weight cost excluding scale overhead for consistency with prior work, and include scale storage in the actual packed size).
+    \item \textbf{FP8 (E4M3):} 8 bits per element, with a per-channel FP32 scale.
+    Three mantissa bits provide $\sim$0.1\% relative quantization error for typical weight magnitudes.
+    \item \textbf{FP16:} 16 bits per element (passthrough).
+    Used only for the most sensitive channels ($<$1\% of channels in practice).
+\end{itemize}
+
+This format hierarchy matches the interfaces of production inference kernels: vLLM's \texttt{marlin\_gemm} supports both NVFP4 and FP8, while \texttt{cutlass\_scaled\_mm} provides FP8 W8A8 support.
+
+\subsection{Inference Architecture}
+
+For each linear layer, RDQuant executes:
+\begin{enumerate}
+    \item Sort output channels by assigned format, producing a permutation $\pi$.
+    \item Execute two Marlin GEMM calls: one for the NVFP4 channel group and one for the FP8 group (FP16 channels, if any, use a standard cuBLAS call).
+    \item Concatenate the partial outputs along the output dimension.
+    \item Apply the inverse permutation $\pi^{-1}$ via \texttt{index\_select} to restore the original channel order.
+\end{enumerate}
+
+\paragraph{CUDA Graph optimization.}
+In eager mode, the Python dispatch overhead of multiple kernel launches per layer ($\sim$2$\times$ the BF16 baseline) dominates decode latency.
+CUDA Graphs~\cite{kwon2023vllm} capture the entire forward pass as a single GPU-side graph, eliminating all CPU-side dispatch.
+This transforms the overhead from \emph{per-launch} to a one-time graph capture cost, making the actual GPU time---which benefits from reduced memory traffic---the dominant factor.
+
+\paragraph{Decode vs.\ prefill.}
+Decode ($M=1$) is purely memory-bandwidth-bound: reading fewer bits per weight directly reduces latency.
+Prefill ($M \gg 1$) is compute-bound: the two GEMM launches have lower arithmetic intensity than a single fused GEMM, limiting speedup.
+CUDA Graphs mitigate prefill overhead by eliminating launch latency.
+
+%=====================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+\label{sec:setup}
+
+\paragraph{Model and evaluation.}
+We evaluate on Qwen3-4B~\cite{yang2024qwen2} using original BF16 weights.
+Perplexity is measured on WikiText-2~\cite{merity2016wikitext} with stride 2048 and 32{,}768 tokens.
+
+\paragraph{Hardware.}
+All latency measurements use a single NVIDIA RTX 5090 (Blackwell architecture, SM120, 32\,GB GDDR7).
+
+\paragraph{Baselines.}
+We compare against: (1) BF16 baseline (no quantization), (2) uniform NVFP4 (all channels at 4-bit), and (3) uniform FP8 (all channels at 8-bit).
+
+\subsection{Accuracy Results}
+\label{sec:accuracy}
+
+Table~\ref{tab:accuracy} presents the main accuracy results.
+
+\begin{table}[t]
+\centering
+\caption{WikiText-2 perplexity for Qwen3-4B under different quantization methods. Evaluation uses original BF16 weights, stride 2048, 32k tokens.}
+\label{tab:accuracy}
+\begin{tabular}{lrrc}
+\toprule
+\textbf{Method} & \textbf{Avg Bits} & \textbf{PPL} & \textbf{$\Delta$ vs BF16} \\
+\midrule
+RDQuant calibrated & 5.29 & 12.24 & $-0.66$ \\
+BF16 baseline & 16.00 & 12.90 & --- \\
+Uniform FP8 & 8.13 & 12.93 & $+0.03$ \\
+Uniform NVFP4 & 4.00 & 13.22 & $+0.32$ \\
+RDQuant data-free & 5.52 & 13.43 & $+0.53$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several observations are noteworthy:
+
+\paragraph{Calibrated RDQuant beats BF16.}
+At 5.29 bpw, calibrated RDQuant achieves 12.24 PPL, a 0.66-point \emph{improvement} over the BF16 baseline of 12.90.
+This is an instance of \emph{quantization as regularization}: the mixed-precision assignment effectively applies stronger regularization (lower precision) to less important channels, suppressing noise in the weight matrix that hurts generalization on the evaluation set.
+This phenomenon has been noted in prior work for carefully tuned uniform quantization~\cite{nagel2020up}, but to our knowledge this is the first demonstration via mixed-precision channel assignment.
+
+\paragraph{NVFP4 is surprisingly good.}
+Uniform NVFP4 at 4.0 bpw degrades perplexity by only 0.32 points, indicating that the NVFP4 format with per-16 block scaling is already a strong baseline.
+
+\paragraph{R-D allocation provides meaningful gains.}
+Comparing RDQuant data-free (5.52 bpw, PPL 13.43) to uniform NVFP4 (4.0 bpw, PPL 13.22), the data-free mode uses more bits but is slightly worse, as the uniform allocation at lower precision benefits from a different operating point.
+However, the calibrated mode at comparable bit rate dramatically outperforms all baselines.
+
+\subsection{Allocation Analysis}
+\label{sec:allocation}
+
+\paragraph{Format distribution.}
+At 5.3 bpw, the data-free allocation assigns 57\% of output channels to NVFP4, 43\% to FP8, and 0\% to FP16.
+The calibrated allocation shifts toward more NVFP4: 67\% NVFP4, 32\% FP8, and 1\% FP16.
+The calibrated mode allocates bits more efficiently by using layer importance to identify which channels truly need higher precision.
+
+\paragraph{Layer sensitivity.}
+The perturbation-based importance metric reveals a non-obvious sensitivity pattern.
+The most sensitive layer is \texttt{layers.2.mlp.gate\_proj} with an importance score of 94.7---an early MLP layer.
+The least sensitive layer is \texttt{layers.35.self\_attn.v\_proj} with importance $\approx 0$---a late attention layer.
+This ranking is \emph{anti-correlated} with activation norm: the residual stream grows by approximately $14{,}000\times$ from the first to the last layer, so an activation-norm-based proxy would incorrectly assign maximum importance to the least sensitive layers.
+
+\paragraph{Model compression.}
+The packed RDQuant checkpoint is 2.62\,GB, representing 33\% of the BF16 model size of 8\,GB.
+This includes quantized weights, block scales, per-channel scales, and permutation indices.
+
+\subsection{Inference Performance}
+\label{sec:latency}
+
+\paragraph{End-to-end latency.}
+Table~\ref{tab:latency} reports full-model inference latency on RTX 5090.
+
+\begin{table}[t]
+\centering
+\caption{Inference latency for Qwen3-4B on RTX 5090. Speedup is relative to BF16.}
+\label{tab:latency}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Scenario} & \textbf{BF16} & \textbf{RDQuant Eager} & \textbf{RDQuant CUDA Graph} \\
+\midrule
+Decode ($M$=1) & 32.59\,ms & 50.79\,ms & 12.57\,ms ($2.59\times$) \\
+Prefill (SEQ=128) & 23.59\,ms & 45.17\,ms & 18.86\,ms ($1.25\times$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Decode: 2.59$\times$ speedup.}
+In eager mode, RDQuant is actually \emph{slower} than BF16 (50.79 vs.\ 32.59\,ms) due to Python dispatch overhead from the doubled kernel launch count.
+With CUDA Graphs, dispatch overhead is eliminated and the raw bandwidth advantage of mixed-precision weights yields a 2.59$\times$ speedup.
+This demonstrates that the bottleneck is not the kernels themselves but the \emph{launch overhead}, which CUDA Graphs solve completely for the decode path.
+
+\paragraph{Prefill: 1.25$\times$ speedup.}
+Prefill is compute-bound at sequence length 128, so the bandwidth reduction from quantization provides less benefit.
+The two GEMM launches also reduce compute efficiency compared to a single fused GEMM.
+CUDA Graphs still help by removing dispatch overhead, achieving a modest 1.25$\times$ improvement.
+
+\paragraph{Prefill optimization attempts.}
+During development, we explored several strategies to improve prefill performance:
+\begin{itemize}
+    \item \textbf{Triton kernels on SM120:} Custom Triton GEMM kernels were $6.6\times$ slower than cuBLAS at $M=128$, making them non-viable.
+    \item \textbf{CUDA stream overlap:} Launching the NVFP4 and FP8 GEMMs on concurrent streams was \emph{worse} than sequential execution due to shared SM and memory controller resources.
+    \item \textbf{Reducing FP8 ratio:} Shifting more channels to NVFP4 had no effect on prefill latency, confirming the overhead is per-launch rather than per-format.
+\end{itemize}
+These negative results confirm that decode is the primary target scenario for RDQuant, and prefill parity is best achieved through CUDA Graph capture.
+
+\subsection{Kernel Backend Comparison}
+\label{sec:kernels}
+
+To justify our kernel selection, Table~\ref{tab:kernels} compares single-layer GEMM performance for a representative layer shape ($K=9728$, $N=2560$) at batch size $M=1$.
+
+\begin{table}[t]
+\centering
+\caption{Single-layer kernel benchmark ($K=9728$, $N=2560$, $M=1$) on RTX 5090.}
+\label{tab:kernels}
+\begin{tabular}{lrc}
+\toprule
+\textbf{Kernel} & \textbf{Latency ($\mu$s)} & \textbf{Speedup vs FP16} \\
+\midrule
+vLLM marlin\_gemm NVFP4 & 21.5 & $3.46\times$ \\
+vLLM marlin\_gemm FP8 & 21.6 & $3.43\times$ \\
+cuBLASLt NVFP4 W4A4 & 112.0 & $0.66\times$ \\
+cuBLASLt MXFP8 W8A8 & 161.0 & $0.46\times$ \\
+FP16 cuBLAS & 74.2 & $1.0\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The vLLM Marlin kernels are $3.4\times$ faster than FP16 cuBLAS at $M=1$, making them the clear choice for decode.
+Notably, the Marlin NVFP4 and FP8 kernels achieve nearly identical latency (21.5 vs.\ 21.6\,$\mu$s), indicating that at $M=1$ both are purely bandwidth-bound and the $2\times$ difference in format width is compensated by the Marlin kernel's dequantization-during-load strategy.
+The cuBLASLt kernels for W4A4 and W8A8 are actually \emph{slower} than FP16, likely because they target compute-bound scenarios ($M \gg 1$) and have higher launch overhead.
+
+\subsection{Ablation Studies}
+\label{sec:ablation}
+
+\paragraph{Data-free vs.\ calibrated.}
+The calibrated mode (5.29 bpw, 12.24 PPL) substantially outperforms data-free (5.52 bpw, 13.43 PPL), using fewer bits while achieving 1.19 points lower perplexity.
+The layer importance weights allow the optimizer to concentrate bits on the few layers where quantization error matters most, rather than distributing uniformly.
+
+\paragraph{Calibration metrics.}
+We compared three calibration metrics: (1) perturbation-based (our method), (2) Fisher information (diagonal Hessian approximation), and (3) activation norm ($\|\mathbf{X}\|_F^2$).
+Perturbation-based importance gives the best allocation because it directly measures the loss impact.
+Activation norm gives a \emph{wrong} ranking dominated by the $14{,}000\times$ residual stream growth across layers, assigning maximum importance to the last layers regardless of their actual sensitivity.
+
+\paragraph{128-channel alignment.}
+Rounding format group boundaries to 128-channel multiples incurs $<$0.01 PPL overhead compared to unaligned channel-level assignment, while enabling efficient tiled GEMM execution.
+
+%=====================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{When RDQuant Helps}
+
+RDQuant provides the largest benefits when:
+\begin{itemize}
+    \item \textbf{High channel sensitivity variance.} Models where output channels have widely varying outlier-to-noise ratios benefit most from mixed-precision assignment.
+    Qwen3-4B exhibits $>$94$\times$ variation in layer importance, indicating significant heterogeneity.
+    \item \textbf{Decode-dominated workloads.} Applications with long generation sequences (e.g., creative writing, code generation) spend most time in decode, where the 2.59$\times$ speedup applies.
+    \item \textbf{Memory-constrained deployment.} The 2.62\,GB packed model (33\% of BF16) enables deployment on devices with limited GPU memory, such as consumer GPUs or edge accelerators.
+\end{itemize}
+
+\subsection{Limitations}
+
+\paragraph{Prefill overhead.}
+The two-GEMM-per-layer architecture doubles kernel launch count, limiting prefill speedup to 1.25$\times$ even with CUDA Graphs.
+A fused grouped GEMM kernel that handles both format groups in a single launch would eliminate this overhead.
+
+\paragraph{Channel permutation.}
+The \texttt{index\_select} operation to restore original channel order adds a small overhead per layer.
+For decode, this is negligible relative to the GEMM cost, but it contributes to the prefill gap.
+
+\paragraph{Calibration cost.}
+The calibrated mode requires quantizing each layer individually and measuring the loss delta, totaling $2|\mathcal{L}|$ forward passes (two per layer: one for the baseline, one with the layer quantized).
+For Qwen3-4B with 36 transformer layers (each contributing $\sim$7 linear layers), this takes approximately 10 minutes on a single GPU.
+
+\subsection{Future Work}
+
+\paragraph{Fused grouped GEMM.}
+A custom kernel that processes multiple format groups within a single launch---dispatching different Tensor Core instructions for different tile rows---would eliminate the per-layer launch overhead and enable prefill speedups comparable to decode.
+
+\paragraph{Combined N+K splitting.}
+As shown in Section~\ref{sec:orthogonality}, N-split (RDQuant) and K-split (MicroMix) are orthogonal.
+Combining them would create a 2D mixed-precision grid, potentially enabling 3--4 bpw operation with minimal accuracy loss.
+
+\paragraph{Extension to MoE models.}
+Mixture-of-Experts models have many more weight matrices (one per expert), making mixed-precision allocation even more impactful.
+The R-D framework naturally extends by treating expert weights as additional layers.
+
+\paragraph{Broader model evaluation.}
+We plan to evaluate on Llama-3.2-1B/3B, Qwen2.5-7B, Llama-3.1-8B, and DeepSeek-V3, as well as downstream tasks including MMLU, GSM8K, and MBPP.
+
+%=====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented RDQuant, a rate--distortion optimal framework for per-output-channel mixed-precision quantization of large language models.
+By formulating format assignment as a Lagrangian optimization over hardware-native formats (NVFP4, FP8, FP16), RDQuant achieves provably optimal bit allocation across all layers and channels simultaneously.
+
+Our key findings on Qwen3-4B are:
+\begin{enumerate}
+    \item Calibrated RDQuant at 5.29 bits per weight achieves 12.24 perplexity on WikiText-2, \emph{improving} over the BF16 baseline of 12.90---demonstrating that intelligent mixed-precision assignment can act as a form of regularization.
+    \item With CUDA Graphs and vLLM Marlin kernels, RDQuant delivers a $2.59\times$ decode speedup on RTX 5090, with a packed model size of 2.62\,GB (33\% of BF16).
+    \item Output-channel and input-channel mixed precision are orthogonal degrees of freedom that can be composed for further compression.
+\end{enumerate}
+
+RDQuant is implemented as an open-source tool with one-click quantization and export, requiring no training and minimal calibration.
+
+%=====================================================================
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

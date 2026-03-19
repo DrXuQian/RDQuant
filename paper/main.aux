@@ -1,0 +1,153 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\citation{kwon2023vllm}
+\citation{frantar2022gptq}
+\citation{lin2024awq}
+\citation{nvidia2024fp4}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{section.1}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{Introduction}{section.1}{}}
+\citation{frantar2022gptq}
+\citation{lin2024awq}
+\citation{kim2023squeezellm}
+\citation{chee2024quip}
+\citation{shao2024omniquant}
+\citation{dong2019hawq}
+\citation{yi2024micromix}
+\citation{guo2024flute}
+\citation{dettmers2022gpt3int8}
+\citation{xiao2023smoothquant}
+\citation{shannon1959coding}
+\citation{cover2006elements}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces WikiText-2 perplexity (PPL) for Qwen3-4B. Lower is better. RDQuant calibrated at 5.29 bits per weight (bpw) \emph  {improves} over the BF16 baseline.}}{2}{table.1}\protected@file@percent }
+\newlabel{tab:headline}{{1}{2}{WikiText-2 perplexity (PPL) for Qwen3-4B. Lower is better. RDQuant calibrated at 5.29 bits per weight (bpw) \emph {improves} over the BF16 baseline}{table.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Background and Related Work}{2}{section.2}\protected@file@percent }
+\newlabel{sec:related}{{2}{2}{Background and Related Work}{section.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Uniform post-training quantization.}{2}{section*.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Mixed-precision quantization.}{2}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{NVIDIA numeric formats.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Rate--distortion theory.}{2}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Method}{3}{section.3}\protected@file@percent }
+\newlabel{sec:method}{{3}{3}{Method}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Output Channel Sensitivity Analysis}{3}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:sensitivity}{{3.1}{3}{Output Channel Sensitivity Analysis}{subsection.3.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Block-scaled quantization model.}{3}{section*.5}\protected@file@percent }
+\newlabel{prop:mse}{{1}{3}{Outlier-induced MSE amplification}{proposition.1}{}}
+\newlabel{eq:mse_bound}{{1}{3}{Outlier-induced MSE amplification}{equation.3.1}{}}
+\newlabel{cor:fp8}{{1}{3}{}{corollary.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Rate--Distortion Optimal Allocation}{3}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:rd}{{3.2}{3}{Rate--Distortion Optimal Allocation}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{Problem formulation.}{3}{section*.6}\protected@file@percent }
+\newlabel{eq:rd_problem}{{4}{3}{Problem formulation}{equation.3.4}{}}
+\citation{yi2024micromix}
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces RDQuant: Rate--Distortion Optimal Channel-Wise Allocation}}{4}{algorithm.1}\protected@file@percent }
+\newlabel{alg:rdquant}{{1}{4}{128-channel alignment}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Lagrangian relaxation.}{4}{section*.7}\protected@file@percent }
+\newlabel{eq:perchannel}{{6}{4}{Lagrangian relaxation}{equation.3.6}{}}
+\newlabel{prop:optimal}{{2}{4}{Optimality}{proposition.2}{}}
+\@writefile{toc}{\contentsline {paragraph}{128-channel alignment.}{4}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Calibrated Layer Importance}{4}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:calibrated}{{3.3}{4}{Calibrated Layer Importance}{subsection.3.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Data-free mode.}{4}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Calibrated mode.}{4}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why activation norm fails.}{4}{section*.11}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Comparison of N-split (RDQuant) and K-split (MicroMix) mixed-precision strategies.}}{5}{table.2}\protected@file@percent }
+\newlabel{tab:nsplit_vs_ksplit}{{2}{5}{Comparison of N-split (RDQuant) and K-split (MicroMix) mixed-precision strategies}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Orthogonality: Output-Channel vs.\ Input-Channel Splitting}{5}{subsection.3.4}\protected@file@percent }
+\newlabel{sec:orthogonality}{{3.4}{5}{Orthogonality: Output-Channel vs.\ Input-Channel Splitting}{subsection.3.4}{}}
+\newlabel{prop:orthogonal}{{3}{5}{Orthogonality of N-split and K-split}{proposition.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Supported Formats and Kernel Integration}{5}{section.4}\protected@file@percent }
+\newlabel{sec:inference}{{4}{5}{Supported Formats and Kernel Integration}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Format Specifications}{5}{subsection.4.1}\protected@file@percent }
+\citation{kwon2023vllm}
+\citation{yang2024qwen2}
+\citation{merity2016wikitext}
+\citation{nagel2020up}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces WikiText-2 perplexity for Qwen3-4B under different quantization methods. Evaluation uses original BF16 weights, stride 2048, 32k tokens.}}{6}{table.3}\protected@file@percent }
+\newlabel{tab:accuracy}{{3}{6}{WikiText-2 perplexity for Qwen3-4B under different quantization methods. Evaluation uses original BF16 weights, stride 2048, 32k tokens}{table.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Inference Architecture}{6}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{CUDA Graph optimization.}{6}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Decode vs.\ prefill.}{6}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Experiments}{6}{section.5}\protected@file@percent }
+\newlabel{sec:experiments}{{5}{6}{Experiments}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Setup}{6}{subsection.5.1}\protected@file@percent }
+\newlabel{sec:setup}{{5.1}{6}{Setup}{subsection.5.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{Model and evaluation.}{6}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Hardware.}{6}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Baselines.}{6}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Accuracy Results}{6}{subsection.5.2}\protected@file@percent }
+\newlabel{sec:accuracy}{{5.2}{6}{Accuracy Results}{subsection.5.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Inference latency for Qwen3-4B on RTX 5090. Speedup is relative to BF16.}}{7}{table.4}\protected@file@percent }
+\newlabel{tab:latency}{{4}{7}{Inference latency for Qwen3-4B on RTX 5090. Speedup is relative to BF16}{table.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{Calibrated RDQuant beats BF16.}{7}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{NVFP4 is surprisingly good.}{7}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{R-D allocation provides meaningful gains.}{7}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Allocation Analysis}{7}{subsection.5.3}\protected@file@percent }
+\newlabel{sec:allocation}{{5.3}{7}{Allocation Analysis}{subsection.5.3}{}}
+\@writefile{toc}{\contentsline {paragraph}{Format distribution.}{7}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Layer sensitivity.}{7}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Model compression.}{7}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Inference Performance}{7}{subsection.5.4}\protected@file@percent }
+\newlabel{sec:latency}{{5.4}{7}{Inference Performance}{subsection.5.4}{}}
+\@writefile{toc}{\contentsline {paragraph}{End-to-end latency.}{7}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Decode: 2.59$\times $ speedup.}{7}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Prefill: 1.25$\times $ speedup.}{7}{section*.25}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Single-layer kernel benchmark ($K=9728$, $N=2560$, $M=1$) on RTX 5090.}}{8}{table.5}\protected@file@percent }
+\newlabel{tab:kernels}{{5}{8}{Single-layer kernel benchmark ($K=9728$, $N=2560$, $M=1$) on RTX 5090}{table.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Prefill optimization attempts.}{8}{section*.26}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Kernel Backend Comparison}{8}{subsection.5.5}\protected@file@percent }
+\newlabel{sec:kernels}{{5.5}{8}{Kernel Backend Comparison}{subsection.5.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.6}Ablation Studies}{8}{subsection.5.6}\protected@file@percent }
+\newlabel{sec:ablation}{{5.6}{8}{Ablation Studies}{subsection.5.6}{}}
+\@writefile{toc}{\contentsline {paragraph}{Data-free vs.\ calibrated.}{8}{section*.27}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Calibration metrics.}{8}{section*.28}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{128-channel alignment.}{8}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Discussion}{9}{section.6}\protected@file@percent }
+\newlabel{sec:discussion}{{6}{9}{Discussion}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}When RDQuant Helps}{9}{subsection.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Limitations}{9}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Prefill overhead.}{9}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Channel permutation.}{9}{section*.31}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Calibration cost.}{9}{section*.32}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Future Work}{9}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Fused grouped GEMM.}{9}{section*.33}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Combined N+K splitting.}{9}{section*.34}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Extension to MoE models.}{9}{section*.35}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Broader model evaluation.}{9}{section*.36}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Conclusion}{9}{section.7}\protected@file@percent }
+\newlabel{sec:conclusion}{{7}{9}{Conclusion}{section.7}{}}
+\bibstyle{plain}
+\bibdata{references}
+\bibcite{chee2024quip}{1}
+\bibcite{cover2006elements}{2}
+\bibcite{dettmers2022gpt3int8}{3}
+\bibcite{dong2019hawq}{4}
+\bibcite{frantar2022gptq}{5}
+\bibcite{guo2024flute}{6}
+\bibcite{kim2023squeezellm}{7}
+\bibcite{kwon2023vllm}{8}
+\bibcite{lin2024awq}{9}
+\bibcite{merity2016wikitext}{10}
+\bibcite{nagel2020up}{11}
+\bibcite{nvidia2024fp4}{12}
+\bibcite{shannon1959coding}{13}
+\bibcite{shao2024omniquant}{14}
+\bibcite{xiao2023smoothquant}{15}
+\bibcite{yang2024qwen2}{16}
+\bibcite{yi2024micromix}{17}
+\gdef \@abspage@last{11}
