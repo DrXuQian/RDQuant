@@ -218,6 +218,20 @@ Observed result on RTX 5090:
   refilling the slot for the subtile two steps ahead. This is a structural move
   toward Marlin's register pipeline even though the current end-to-end latency
   impact is still mixed.
+- The split-K FP8 chunk helpers now also use explicit register staging instead
+  of rebuilding the same packed-word and `x` fragment state inside each
+  `16-K`/`32-K` helper call. On RTX 5090 this produces a small but repeatable
+  end-to-end improvement on the current best path, with representative
+  `BestSK` numbers in the `~279-281us` range across the 7 target layers.
+- Remote `ncu` runs on RTX 5070 show the same direction:
+  - `q_proj` wide split-K keeps about the same kernel duration, but improves
+    `eligible warps` (`0.50 -> 0.53`) and cuts long-scoreboard stall
+    (`5.73 -> 4.60`)
+  - `down_proj` narrow split-K keeps about the same kernel duration, but
+    reduces the dominant MIO throttle stall (`18.02 -> 15.19`)
+  This makes the next iteration target clearer: keep trimming helper-side
+  shared-load pressure and control overhead before attempting a larger pipeline
+  rewrite.
 - Remote `ncu` runs on RTX 5070 now show the current scalar-NVFP4 split-K path
   is primarily limited by scheduler eligibility and MIO/scoreboard pressure,
   not raw DRAM bandwidth:

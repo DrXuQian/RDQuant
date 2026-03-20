@@ -178,6 +178,20 @@ Current progress on this sequence:
   instead of reloading/converting it inside every `16-K` or `32-K` chunk. This
   keeps the main split-K kernels at `REG=56` while slightly improving the
   current best-of-two fused latency.
+- The next small FP8 cleanup step now also stages chunk-local packed words and
+  `x` fragments into registers through a dedicated chunk helper, instead of
+  rebuilding them inside each `16-K` chunk compute call. This is still not a
+  Marlin fragment engine, but it removes duplicated helper-side shared reads
+  and address arithmetic from both the narrow and wide FP8 chunk paths.
+- The current measurements line up with that change:
+  - local RTX 5090 runs move the per-layer `BestSK` total from the earlier
+    `~281.6us` baseline into the `~279-281us` range
+  - remote RTX 5070 `ncu` runs show:
+    - `q_proj` wide path: long-scoreboard `5.73 -> 4.60`, eligible warps
+      `0.50 -> 0.53`
+    - `down_proj` narrow path: MIO throttle `18.02 -> 15.19`
+  So the helper-side register staging is behaving as intended even though the
+  total kernel duration gain is still modest.
 
 ## Why FP8 First
 
