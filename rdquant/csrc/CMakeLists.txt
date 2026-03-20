@@ -5,7 +5,18 @@ project(rdquant_cuda LANGUAGES CXX CUDA)
 # for __CUDA_ARCH_FEAT_SM120_ALL (required by CUTLASS block-scaled MMA).
 set(CMAKE_CUDA_ARCHITECTURES OFF)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode arch=compute_120a,code=sm_120a")
-set(CUTLASS_ROOT "/root/autodl-tmp/TensorRT-LLM-src/cpp/build-official-full-micro/_deps/cutlass-src")
+
+if(NOT DEFINED CUTLASS_ROOT)
+    if(DEFINED ENV{CUTLASS_ROOT})
+        set(CUTLASS_ROOT "$ENV{CUTLASS_ROOT}")
+    else()
+        set(CUTLASS_ROOT "/root/autodl-tmp/TensorRT-LLM-src/cpp/build-official-full-micro/_deps/cutlass-src")
+    endif()
+endif()
+
+if(NOT EXISTS "${CUTLASS_ROOT}/include/cutlass/cutlass.h")
+    message(FATAL_ERROR "CUTLASS_ROOT is invalid: ${CUTLASS_ROOT}")
+endif()
 
 # Find Python
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
