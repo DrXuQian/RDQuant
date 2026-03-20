@@ -55,6 +55,8 @@ Implemented:
   This does not change the algorithm yet, but it gives the mixed scheduler a
   clean seam where the current scalar decode path can be replaced with a
   Marlin-style tile engine without rewriting the outer split-K scheduler again.
+  The current implementation is now explicitly routed through scalar backends,
+  so future Marlin-style replacements can land behind the same wrapper names.
 
 Observed result on RTX 5090:
 

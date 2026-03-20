@@ -170,7 +170,7 @@ __device__ __forceinline__ float run_fp8_tile(
   return acc;
 }
 
-__device__ __forceinline__ float run_nvfp4_qweight_k_tile(
+__device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
     const int32_t* __restrict__ w_fp4_q,
     const uint8_t* __restrict__ w_fp4_scales,
     float w_fp4_global_scale,
@@ -210,7 +210,7 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile(
   return acc;
 }
 
-__device__ __forceinline__ float run_fp8_qweight_k_tile(
+__device__ __forceinline__ float run_fp8_qweight_k_tile_scalar(
     const int32_t* __restrict__ w_fp8_q,
     const float* __restrict__ w_fp8_scales,
     const int32_t* __restrict__ fp8_word_row,
@@ -249,6 +249,40 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile(
   }
 
   return acc;
+}
+
+// Keep a stable entry point for each dtype path so the mixed scheduler does not
+// need to change again when the scalar path is replaced with a Marlin-style
+// tile engine.
+__device__ __forceinline__ float run_nvfp4_qweight_k_tile(
+    const int32_t* __restrict__ w_fp4_q,
+    const uint8_t* __restrict__ w_fp4_scales,
+    float w_fp4_global_scale,
+    const int32_t* __restrict__ fp4_word_row,
+    const int32_t* __restrict__ fp4_slot_row,
+    const half* __restrict__ x_tile,
+    int channel,
+    int n_tile,
+    int fp4_row_stride,
+    int k,
+    int k0) {
+  return run_nvfp4_qweight_k_tile_scalar(
+      w_fp4_q, w_fp4_scales, w_fp4_global_scale, fp4_word_row, fp4_slot_row,
+      x_tile, channel, n_tile, fp4_row_stride, k, k0);
+}
+
+__device__ __forceinline__ float run_fp8_qweight_k_tile(
+    const int32_t* __restrict__ w_fp8_q,
+    const float* __restrict__ w_fp8_scales,
+    const int32_t* __restrict__ fp8_word_row,
+    const half* __restrict__ x_tile,
+    int channel,
+    int n_tile,
+    int fp8_row_stride,
+    int k0) {
+  return run_fp8_qweight_k_tile_scalar(
+      w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, channel, n_tile,
+      fp8_row_stride, k0);
 }
 
 __global__ void fused_mixed_gemv_kernel(
