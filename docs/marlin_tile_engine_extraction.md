@@ -144,6 +144,18 @@ Current progress on this sequence:
   - staged-NVFP4 split-K kernel: `REG=64`, `SHARED=10500`
   It still does not have Marlin's deeper multi-stage pipeline or cp.async-based
   activation/scales staging, so there is still headroom in the inner loop.
+- Remote `ncu` runs on RTX 5070 also now confirm that the current split-K path
+  is not uniformly memory-bound:
+  - `q_proj` scalar `SplitK` sits around compute `57.7%` / DRAM `31.0%`
+  - `down_proj` scalar `SplitK` sits around compute `90.3%` / DRAM `18.4%`
+  That is exactly why a single global FP8 chunk size is not ideal.
+- RDQuant therefore now keeps two scalar-NVFP4 split-K FP8 chunk variants:
+  - a narrow `16-K` chunk kernel (`SHARED=5380`)
+  - a wider `32-K` chunk kernel (`SHARED=9476`)
+  The launch path only uses the wider FP8 chunk kernel for small-FP8-group
+  shapes (`N_fp8 <= 128`, `K >= 4096`), which matches the current `o_proj` /
+  `down_proj` corner without paying that shared-memory cost on the rest of the
+  decode layers.
 
 ## Why FP8 First
 

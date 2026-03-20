@@ -246,6 +246,33 @@ Observed result on RTX 5090:
 - This means the lighter chunk overlap preserves most of the useful FP8 overlap
   structure while removing the pathological shared-memory blow-up from the
   earlier whole-`kBlockK` ping-pong design.
+- Remote `ncu` profiling is now wired up on a separate RTX 5070 WSL machine,
+  and the first four targeted reports are in place for:
+  - `q_proj` scalar `SplitK`
+  - `q_proj` `Split4S`
+  - `down_proj` scalar `SplitK`
+  - `down_proj` `Split4S`
+- The most important observations from those reports are:
+  - `q_proj` scalar `SplitK`: `41.09us`, `REG=56`, `static shared=4.36KB`,
+    achieved occupancy `58.62%`, compute throughput `57.70%`, DRAM throughput
+    `31.04%`
+  - `q_proj` `Split4S`: `40.86us`, `REG=64`, `static shared=9.48KB`, achieved
+    occupancy `55.64%`
+  - `down_proj` scalar `SplitK`: `120.10us`, achieved occupancy `68.59%`,
+    compute throughput `90.29%`, DRAM throughput only `18.44%`
+  - `down_proj` `Split4S`: `122.91us`, achieved occupancy `61.69%`
+- In other words, `down_proj` is clearly not DRAM-saturated; it is much more
+  compute/synchronization heavy than memory-bandwidth limited. That made it a
+  good target for a slightly wider FP8 overlap granularity, but only when the
+  FP8 group is small enough to justify the extra shared-memory footprint.
+- The main scalar-NVFP4 split-K path now has two physical FP8 chunk variants:
+  - the original `16-K` chunk version at `REG=56`, `SHARED=5380`
+  - a `32-K` wide-FP8 version at `REG=56`, `SHARED=9476`
+- The host launch path selects the wide-FP8 kernel only for small FP8 groups
+  (`N_fp8 <= 128` with `K >= 4096`), which covers the `o_proj` and
+  `down_proj`-style shapes without forcing the larger shared footprint on the
+  broader set of layers where the original `16-K` chunk version remains the
+  safer default.
 - The current `1 CTA = 1 output tile` scheduler is also fundamentally
   under-parallelized on RTX 5090 (`170` SMs):
   - `q_proj`: `32` tiles
