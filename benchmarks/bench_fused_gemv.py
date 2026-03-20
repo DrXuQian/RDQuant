@@ -1,5 +1,6 @@
 """Benchmark the tiled fused mixed-precision GEMV prototype."""
 
+import argparse
 import sys
 
 import torch
@@ -55,6 +56,71 @@ def bench(fn, warmup=200, repeat=1000):
 def choose_parallel_k(n_tiles, k, target_ctas=None):
     del n_tiles, target_ctas
     return k // K_TILE
+
+
+def parallel_k_candidates(num_tiles, k, sm_count):
+    max_parallel_k = k // K_TILE
+    candidates = {
+        1,
+        2,
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        32,
+        40,
+        48,
+        64,
+        76,
+        max_parallel_k,
+        max(1, (2 * sm_count + num_tiles - 1) // num_tiles),
+        max(1, (4 * sm_count + num_tiles - 1) // num_tiles),
+    }
+    return sorted(p for p in candidates if p <= max_parallel_k)
+
+
+def autotune_parallel_k(
+    x_fp16,
+    w_fp4_q,
+    w_fp4_scales,
+    w_fp8_q,
+    w_fp8_scales,
+    fp4_word_offsets,
+    fp4_slot_map,
+    fp8_word_offsets,
+    inv_perm,
+    n_fp4,
+    n_fp8,
+    k,
+    sweep_warmup,
+    sweep_repeat,
+):
+    num_tiles = (n_fp4 + 127) // 128 + (n_fp8 + 127) // 128
+    sm_count = torch.cuda.get_device_properties(x_fp16.device).multi_processor_count
+    best_parallel_k = None
+    best_latency = None
+
+    for parallel_k in parallel_k_candidates(num_tiles, k, sm_count):
+        workspace = torch.zeros(n_fp4 + n_fp8, device=x_fp16.device, dtype=torch.float32)
+        tile_counters = torch.zeros(num_tiles, device=x_fp16.device, dtype=torch.int32)
+        latency = bench(
+            lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk(
+                x_fp16, w_fp4_q, w_fp4_scales, 1.0,
+                w_fp8_q, w_fp8_scales,
+                fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+                inv_perm, workspace, tile_counters,
+                n_fp4, n_fp8, k, parallel_k
+            ),
+            warmup=sweep_warmup,
+            repeat=sweep_repeat,
+        )
+        if best_latency is None or latency < best_latency:
+            best_latency = latency
+            best_parallel_k = parallel_k
+
+    return best_parallel_k, best_latency
 
 
 def fp8_e4m3_encode(val_f32):
@@ -425,29 +491,26 @@ def test_correctness():
     return ok
 
 
-def bench_shapes():
+def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
     """Benchmark fused GEMV vs cuBLAS BF16 for all Qwen3-4B shapes."""
     print("=" * 60)
     print("Performance benchmark: 2x Marlin vs fused split-K vs cuBLAS BF16 GEMV")
     print("=" * 60)
     print(f"{'Layer':<14} {'N':>6} {'K':>6} {'N4':>5} {'N8':>5} "
           f"{'cuBLAS':>8} {'Mrl4':>8} {'Mrl8':>8} {'M4+8':>8} {'2xMrl':>8} "
-          f"{'Base':>8} {'SplitK':>8} {'P_K':>5}")
-    print("-" * 128)
+          f"{'Base':>8} {'SplitK':>8} {'P_K':>5} {'Mode':>8}")
+    print("-" * 138)
 
     fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps()
 
     for name, N, K, N_fp4, N_fp8 in QWEN3_4B_SHAPES:
         N_total = N_fp4 + N_fp8
         num_tiles = (N_fp4 + 127) // 128 + (N_fp8 + 127) // 128
-        parallel_k = choose_parallel_k(num_tiles, K)
-        workspace = torch.zeros(N_total, device=DEVICE, dtype=torch.float32)
-        tile_counters = torch.zeros(num_tiles, device=DEVICE, dtype=torch.int32)
 
         # --- cuBLAS BF16 baseline ---
         x_bf16 = torch.randn(1, K, device=DEVICE, dtype=torch.bfloat16)
         w_bf16 = torch.randn(N, K, device=DEVICE, dtype=torch.bfloat16)
-        t_cublas = bench(lambda: F.linear(x_bf16, w_bf16))
+        t_cublas = bench(lambda: F.linear(x_bf16, w_bf16), warmup=warmup, repeat=repeat)
 
         # --- Fused GEMV ---
         x_fp16 = torch.randn(1, K, device=DEVICE, dtype=torch.float16)
@@ -464,42 +527,62 @@ def bench_shapes():
         marlin_fp8_scales = prepare_marlin_fp8_scales(w_fp8_scales, K, N_fp8)
         marlin_ws4 = marlin_make_workspace_new(torch.device(DEVICE))
         marlin_ws8 = marlin_make_workspace_new(torch.device(DEVICE))
+        if parallel_k_mode == "sweep":
+            parallel_k, _ = autotune_parallel_k(
+                x_fp16, w_fp4_q, w_fp4_scales,
+                w_fp8_q, w_fp8_scales,
+                fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+                inv_perm, N_fp4, N_fp8, K,
+                sweep_warmup, sweep_repeat,
+            )
+        else:
+            parallel_k = choose_parallel_k(num_tiles, K)
+        workspace = torch.zeros(N_total, device=DEVICE, dtype=torch.float32)
+        tile_counters = torch.zeros(num_tiles, device=DEVICE, dtype=torch.int32)
 
         t_marlin_fp4 = bench(lambda: run_marlin_nvfp4(
             x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale,
             marlin_ws4, N_fp4, K
-        ))
+        ), warmup=warmup, repeat=repeat)
         t_marlin_fp8 = bench(lambda: run_marlin_fp8(
             x_fp16, w_fp8_q, marlin_fp8_scales, marlin_ws8, N_fp8, K
-        ))
+        ), warmup=warmup, repeat=repeat)
         t_marlin_sum = t_marlin_fp4 + t_marlin_fp8
         t_marlin = bench(lambda: run_marlin_mixed(
             x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale, marlin_ws4,
             N_fp4, w_fp8_q, marlin_fp8_scales, marlin_ws8, N_fp8, K, inv_perm
-        ))
+        ), warmup=warmup, repeat=repeat)
         t_fused = bench(lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights(
             x_fp16, w_fp4_q, w_fp4_scales, 1.0,
             w_fp8_q, w_fp8_scales,
             fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
             inv_perm,
             N_fp4, N_fp8, K
-        ))
+        ), warmup=warmup, repeat=repeat)
         t_splitk = bench(lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk(
             x_fp16, w_fp4_q, w_fp4_scales, 1.0,
             w_fp8_q, w_fp8_scales,
             fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
             inv_perm, workspace, tile_counters,
             N_fp4, N_fp8, K, parallel_k
-        ))
+        ), warmup=warmup, repeat=repeat)
         print(f"{name:<14} {N:>6} {K:>6} {N_fp4:>5} {N_fp8:>5} "
               f"{t_cublas:>7.1f}us {t_marlin_fp4:>7.1f}us {t_marlin_fp8:>7.1f}us "
               f"{t_marlin_sum:>7.1f}us {t_marlin:>7.1f}us {t_fused:>7.1f}us "
-              f"{t_splitk:>7.1f}us {parallel_k:>5}")
+              f"{t_splitk:>7.1f}us {parallel_k:>5} {parallel_k_mode:>8}")
 
     print()
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--parallel-k-mode", choices=("fixed", "sweep"), default="fixed")
+    parser.add_argument("--warmup", type=int, default=200)
+    parser.add_argument("--repeat", type=int, default=1000)
+    parser.add_argument("--sweep-warmup", type=int, default=50)
+    parser.add_argument("--sweep-repeat", type=int, default=200)
+    args = parser.parse_args()
+
     print(f"Device: {torch.cuda.get_device_name()}\n")
 
     ok = test_correctness()
@@ -507,7 +590,13 @@ def main():
         print("Correctness test FAILED — skipping benchmarks")
         return
 
-    bench_shapes()
+    bench_shapes(
+        args.parallel_k_mode,
+        args.warmup,
+        args.repeat,
+        args.sweep_warmup,
+        args.sweep_repeat,
+    )
 
 
 if __name__ == "__main__":

@@ -126,6 +126,20 @@ Observed result on RTX 5090:
 - This confirms the mixed fused path is mostly winning by eliminating a second
   high-fixed-cost launch, with the largest benefit showing up when one group is
   small enough to be a poor standalone Marlin decode kernel.
+- A benchmark-side `parallel_k` sweep was added and confirms the current full
+  split choice is already the best among a reasonable candidate set for all 7
+  target shapes:
+  - `q_proj`: best `parallel_k = 20`
+  - `k_proj`: best `parallel_k = 20`
+  - `v_proj`: best `parallel_k = 20`
+  - `o_proj`: best `parallel_k = 32`
+  - `gate_proj`: best `parallel_k = 20`
+  - `up_proj`: best `parallel_k = 20`
+  - `down_proj`: best `parallel_k = 76`
+- In other words, `parallel_k = K / 128` is not just a placeholder heuristic for
+  this prototype; on the current sweep it is already the best-performing choice.
+  That makes the remaining bottleneck much more clearly an inner-loop issue than
+  an outer scheduling issue.
 - `cuobjdump --dump-resource-usage` for the split-K kernel reports:
   - `REG=56`
   - `SHARED=1284`
