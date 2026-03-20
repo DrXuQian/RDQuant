@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.22 (TeX Live 2022/dev/Debian) (preloaded format=pdflatex 2026.3.20)  20 MAR 2026 07:04
+This is pdfTeX, Version 3.141592653-2.6-1.40.22 (TeX Live 2022/dev/Debian) (preloaded format=pdflatex 2026.3.20)  20 MAR 2026 08:23
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -507,12 +507,19 @@ as been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
 l.121 
-      ] [3]
+      ]
+Overfull \hbox (1.31314pt too wide) in paragraph at lines 184--187
+ []\OT1/cmr/bx/n/10 Block-scaled quan-ti-za-tion model.[] \OT1/cmr/m/n/10 We no
+w char-ac-ter-ize $[][](\OML/cmm/m/it/10 f[]\OT1/cmr/m/n/10 )$ for block-scaled
+ for-mats. In NVFP4,
+ []
+
+[3] [4]
 Package hyperref Info: bookmark level for unknown algorithm defaults to 0 on in
-put line 210.
+put line 287.
 
 ! Undefined control sequence.
-l.212 \SetAlgoLined
+l.289 \SetAlgoLined
                    
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -521,7 +528,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.213 \KwIn
+l.290 \KwIn
            {Model weights $\{\mathbf{W}_\ell\}_{\ell \in \mathcal{L}}$, form...
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -530,7 +537,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.214 \KwOut
+l.291 \KwOut
             {Format assignment $\{f_{\ell,j}\}$, quantized weights}
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -539,7 +546,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.216 \tcp
+l.293 \tcp
           {Step 1: Compute per-channel distortions}
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -548,7 +555,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.217 \ForEach
+l.294 \ForEach
               {layer $\ell \in \mathcal{L}$}{
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -557,7 +564,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.218     \ForEach
+l.295     \ForEach
                   {output channel $j = 1, \ldots, N_\ell$}{
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -566,7 +573,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.219         \ForEach
+l.296         \ForEach
                       {format $f \in \mathcal{F}$}{
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -575,7 +582,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.224 \tcp
+l.301 \tcp
           {Step 2: Binary search on Lagrange multiplier}
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -586,7 +593,7 @@ and I'll forget about whatever was undefined.
 ! Missing \endcsname inserted.
 <to be read again> 
                    \ALG@currentblock@0 
-l.226 \For
+l.303 \For
           {$t = 1, \ldots, 64$}{
 The control sequence marked <to be read again> should
 not appear between \csname and \endcsname.
@@ -594,7 +601,7 @@ not appear between \csname and \endcsname.
 ! Extra \endcsname.
 \ALG@makebeginrepeat ...\ALG@thisblock \endcsname 
                                                   \relax \def \ALG@thisblock...
-l.226 \For
+l.303 \For
           {$t = 1, \ldots, 64$}{
 I'm ignoring this, since I wasn't doing a \csname.
 
@@ -605,18 +612,18 @@ See the LaTeX manual or LaTeX Companion for explanation.
 Type  H <return>  for immediate help.
  ...                                              
                                                   
-l.226 \For
+l.303 \For
           {$t = 1, \ldots, 64$}{
 Try typing  <return>  to proceed.
 If that doesn't work, type  X <return>  to quit.
 
 
-Underfull \hbox (badness 10000) detected at line 226
+Underfull \hbox (badness 10000) detected at line 303
 [][]
  []
 
 ! Undefined control sequence.
-l.228     \ForEach
+l.305     \ForEach
                   {$(\ell, j)$}{
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -625,7 +632,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.232     \lIf
+l.309     \lIf
               {$R > B_\text{total}$}{$\lambda_\text{lo} \leftarrow \lambda$}
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -634,7 +641,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.233     \lElse
+l.310     \lElse
                 {$\lambda_\text{hi} \leftarrow \lambda$}
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -643,7 +650,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.235 \tcp
+l.312 \tcp
           {Step 3: Align to 128-channel groups and quantize}
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -652,7 +659,7 @@ spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
 ! Undefined control sequence.
-l.236 \ForEach
+l.313 \ForEach
               {layer $\ell$}{
 The control sequence at the end of the top line
 of your error message was never \def'ed. If you have
@@ -660,69 +667,69 @@ misspelled it (e.g., `\hobx'), type `I' and the correct
 spelling (e.g., `I\hbox'). Otherwise just continue,
 and I'll forget about whatever was undefined.
 
-[4] [5pdfTeX warning (ext4): destination with the same identifier (name{table.2
+[5] [6pdfTeX warning (ext4): destination with the same identifier (name{table.2
 }) has been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.336     \item S
-                 ort output channels by assigned format, producing a permuta...
-] [6pdfTeX warning (ext4): destination with the same identifier (name{table.3})
- has been already used, duplicate ignored
+l.403     \item \textbf
+                       {FP16:} 16 bits per element (passthrough).] [7] [8pdfTeX
+ warning (ext4): destination with the same identifier (name{table.3}) has been 
+already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.397 
-      ] [7pdfTeX warning (ext4): destination with the same identifier (name{tab
-le.4}) has been already used, duplicate ignored
+l.529 
+      pdfTeX warning (ext4): destination with the same identifier (name{table.4
+}) has been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.456     \item \textbf
-                       {Triton kernels on SM120:} Custom Triton GEMM kernels...
-] [8pdfTeX warning (ext4): destination with the same identifier (name{table.5})
- has been already used, duplicate ignored
+l.529 
+      ] [9pdfTeX warning (ext4): destination with the same identifier (name{tab
+le.5}) has been already used, duplicate ignored
 <argument> ...shipout:D \box_use:N \l_shipout_box 
                                                   \__shipout_drop_firstpage_...
-l.511     \item \textbf
+l.588     \item \textbf
                        {High channel sensitivity variance.} Models where out...
-] [9] (./main.bbl [10]) [11] (./main.aux)
+] [10] (./main.bbl [11]) [12] (./main.aux)
 Package rerunfilecheck Info: File `main.out' has not changed.
 (rerunfilecheck)             Checksum: BA138CBDCC4754F8C6C196DEF6264C67;3529.
  ) 
 Here is how much of TeX's memory you used:
- 11453 strings out of 480171
- 175262 string characters out of 5894489
- 476412 words of memory out of 5000000
- 29118 multiletter control sequences out of 15000+600000
- 481845 words of font info for 75 fonts, out of 8000000 for 9000
+ 11487 strings out of 480171
+ 175677 string characters out of 5894489
+ 478859 words of memory out of 5000000
+ 29132 multiletter control sequences out of 15000+600000
+ 483675 words of font info for 81 fonts, out of 8000000 for 9000
  59 hyphenation exceptions out of 8191
  60i,9n,63p,398b,448s stack positions out of 5000i,500n,10000p,200000b,80000s
  </root/.texlive2021/texmf-var/fonts/pk/ljfour/jknappen/ec/tcrm1000.600pk></u
 sr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb></usr/sha
 re/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx12.pfb></usr/share/tex
-live/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx9.pfb></usr/share/texlive/te
-xmf-dist/fonts/type1/public/amsfonts/cm/cmbxti10.pfb></usr/share/texlive/texmf-
-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/share/texlive/texmf-dist/f
-onts/type1/public/amsfonts/cmextra/cmex7.pfb></usr/share/texlive/texmf-dist/fon
-ts/type1/public/amsfonts/cm/cmmi10.pfb></usr/share/texlive/texmf-dist/fonts/typ
-e1/public/amsfonts/cm/cmmi5.pfb></usr/share/texlive/texmf-dist/fonts/type1/publ
-ic/amsfonts/cm/cmmi7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsf
-onts/cm/cmmi9.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm
-/cmr10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr12.
-pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr17.pfb></u
-sr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/share
-/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/share/texlive
-/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/share/texlive/texmf
--dist/fonts/type1/public/amsfonts/cm/cmsy5.pfb></usr/share/texlive/texmf-dist/f
-onts/type1/public/amsfonts/cm/cmsy7.pfb></usr/share/texlive/texmf-dist/fonts/ty
-pe1/public/amsfonts/cm/cmsy9.pfb></usr/share/texlive/texmf-dist/fonts/type1/pub
-lic/amsfonts/cm/cmti10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/am
-sfonts/cm/cmti7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/
-cm/cmti9.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt
-10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm1
-0.pfb>
-Output written on main.pdf (11 pages, 350681 bytes).
+live/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx7.pfb></usr/share/texlive/te
+xmf-dist/fonts/type1/public/amsfonts/cm/cmbx9.pfb></usr/share/texlive/texmf-dis
+t/fonts/type1/public/amsfonts/cm/cmbxti10.pfb></usr/share/texlive/texmf-dist/fo
+nts/type1/public/amsfonts/cm/cmex10.pfb></usr/share/texlive/texmf-dist/fonts/ty
+pe1/public/amsfonts/cmextra/cmex7.pfb></usr/share/texlive/texmf-dist/fonts/type
+1/public/amsfonts/cm/cmmi10.pfb></usr/share/texlive/texmf-dist/fonts/type1/publ
+ic/amsfonts/cm/cmmi5.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsf
+onts/cm/cmmi7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm
+/cmmi9.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmmib1
+0.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb><
+/usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr12.pfb></usr/sh
+are/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr17.pfb></usr/share/tex
+live/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/share/texlive/tex
+mf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/share/texlive/texmf-dist/
+fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/share/texlive/texmf-dist/fonts/
+type1/public/amsfonts/cm/cmsy5.pfb></usr/share/texlive/texmf-dist/fonts/type1/p
+ublic/amsfonts/cm/cmsy7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/a
+msfonts/cm/cmsy9.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts
+/cm/cmti10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cm
+ti7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmti9.pfb
+></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmtt10.pfb></usr
+/share/texlive/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb>
+Output written on main.pdf (12 pages, 377777 bytes).
 PDF statistics:
- 418 PDF objects out of 1000 (max. 8388607)
- 352 compressed objects within 4 object streams
- 118 named destinations out of 1000 (max. 500000)
+ 453 PDF objects out of 1000 (max. 8388607)
+ 382 compressed objects within 4 object streams
+ 132 named destinations out of 1000 (max. 500000)
  177 words of extra memory for PDF output out of 10000 (max. 10000000)
 

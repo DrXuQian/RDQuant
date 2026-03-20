@@ -116,13 +116,74 @@ The optimal allocation across multiple sources (channels) under a total rate bud
 \subsection{Output Channel Sensitivity Analysis}
 \label{sec:sensitivity}
 
-Consider a linear layer with weight matrix $\mathbf{W} \in \mathbb{R}^{N \times K}$, where $N$ is the number of output channels and $K$ is the input dimension.
-We analyze the quantization error for a single output channel $\mathbf{w} \in \mathbb{R}^K$ under block-scaled quantization.
+Consider a linear layer $\mathbf{y} = \mathbf{W}\mathbf{x} + \mathbf{b}$ with weight matrix $\mathbf{W} \in \mathbb{R}^{N \times K}$, input $\mathbf{x} \in \mathbb{R}^K$, and output $\mathbf{y} \in \mathbb{R}^N$.
+We first establish how weight quantization error propagates to the model output, then show that different output channels have fundamentally different sensitivities.
+
+\paragraph{From weight error to output error.}
+Let $\hat{\mathbf{W}}$ denote the quantized weight.
+The output perturbation for channel $j$ is:
+\begin{equation}
+\label{eq:delta_y}
+\Delta y_j = (\hat{\mathbf{w}}_j - \mathbf{w}_j)^\top \mathbf{x} = \boldsymbol{\delta}_j^\top \mathbf{x},
+\end{equation}
+where $\boldsymbol{\delta}_j = \hat{\mathbf{w}}_j - \mathbf{w}_j$ is the per-element quantization error for output channel $j$.
+
+\begin{proposition}[Output-channel sensitivity]
+\label{prop:sensitivity}
+Assuming the quantization errors $\delta_{j,k}$ are uncorrelated with the input $\mathbf{x}$, the expected squared output error for channel $j$ is:
+\begin{equation}
+\label{eq:output_mse}
+\mathbb{E}_{\mathbf{x}}\!\left[(\Delta y_j)^2\right] = \sum_{k=1}^K \mathbb{E}[\delta_{j,k}^2] \cdot \mathbb{E}[x_k^2] = \sum_{k=1}^K \text{MSE}_{j,k}(f_j) \cdot s_k^2,
+\end{equation}
+where $\text{MSE}_{j,k}(f_j)$ is the weight quantization error for element $(j,k)$ under format $f_j$, and $s_k^2 = \mathbb{E}[x_k^2]$ is the second moment of input channel $k$.
+\end{proposition}
+
+\begin{proof}
+Expanding the square in Eq.~\eqref{eq:delta_y}:
+$\mathbb{E}[(\Delta y_j)^2] = \mathbb{E}\!\left[\sum_{k,k'} \delta_{j,k}\, x_k\, \delta_{j,k'}\, x_{k'}\right]$.
+By the independence assumption between $\boldsymbol{\delta}_j$ and $\mathbf{x}$, cross-terms with $k \neq k'$ vanish in expectation, yielding the diagonal sum~\eqref{eq:output_mse}.
+\end{proof}
+
+\begin{remark}
+This result is analogous to the activation-aware analysis in AWQ~\cite{lin2024awq}, which uses $s_k^2$ to identify important \emph{input} channels for per-channel scaling.
+The key difference is that Eq.~\eqref{eq:output_mse} shows the output error depends on $\text{MSE}_{j,k}(f_j)$ which varies across \emph{output} channels $j$ due to different weight distributions.
+Two channels sharing the same $\{s_k^2\}$ can have vastly different output errors under the same format if their weight distributions differ.
+\end{remark}
+
+\paragraph{Connection to model loss.}
+For a model with loss $\mathcal{L}$, a first-order Taylor expansion around the unquantized output gives:
+\begin{equation}
+\label{eq:loss_expansion}
+\Delta\mathcal{L} \approx \sum_{j=1}^N \frac{\partial \mathcal{L}}{\partial y_j}\,\Delta y_j + \frac{1}{2}\sum_{j=1}^N h_j\,(\Delta y_j)^2,
+\end{equation}
+where $h_j = \partial^2\mathcal{L}/\partial y_j^2$ is the Hessian diagonal for channel $j$.
+Taking expectations and noting that $\mathbb{E}[\Delta y_j] \approx 0$ for symmetric rounding:
+\begin{equation}
+\label{eq:expected_loss}
+\mathbb{E}[\Delta\mathcal{L}] \approx \frac{1}{2}\sum_{j=1}^N h_j \sum_{k=1}^K \text{MSE}_{j,k}(f_j) \cdot s_k^2.
+\end{equation}
+
+\begin{corollary}[Per-channel importance]
+\label{cor:importance}
+The importance of output channel $j$ for quantization is:
+\begin{equation}
+\label{eq:importance}
+I_j = h_j \cdot \sum_{k=1}^K \text{MSE}_{j,k}(f_j) \cdot s_k^2.
+\end{equation}
+Channels with large $I_j$ should receive higher-precision formats.
+This importance has three multiplicative factors: (i) the Hessian $h_j$ (how much the loss cares about this output), (ii) the weight MSE (how well the format preserves the weights), and (iii) the activation magnitude $s_k^2$ (how much the weight error gets amplified).
+\end{corollary}
+
+\paragraph{Simplification.}
+In our data-free mode, we set $h_j = 1$ and $s_k^2 = 1$ for all $j, k$ (uniform importance), reducing Eq.~\eqref{eq:importance} to:
+$I_j^{\text{free}} = \sum_k \text{MSE}_{j,k}(f_j) = K \cdot \overline{\text{MSE}}_j(f_j)$,
+which is the row-wise weight MSE used in our R-D allocation.
+In calibrated mode, the perturb metric directly measures $\mathbb{E}[\Delta\mathcal{L}]$ for each layer, capturing the product $h_j \cdot s_k^2$ empirically without separate estimation.
 
 \paragraph{Block-scaled quantization model.}
+We now characterize $\text{MSE}_{j,k}(f_j)$ for block-scaled formats.
 In NVFP4, the weight vector is partitioned into blocks of size $B = 16$.
-Within each block, a single FP8 scale $s$ is chosen (typically the maximum absolute value divided by the format's maximum representable value), and each element is rounded to the nearest E2M1 grid point after division by $s$.
-Let $q_\text{max}$ denote the largest representable value in E2M1; for NVFP4, $q_\text{max} = 6.0$.
+Within each block, a single FP8 scale $s$ is chosen (the maximum absolute value divided by $q_\text{max} = 6.0$), and each element is rounded to the nearest E2M1 grid point after division by $s$.
 
 \begin{proposition}[Outlier-induced MSE amplification]
 \label{prop:mse}
@@ -138,21 +199,37 @@ In particular, when $m \gg 6\sigma$, the MSE approaches $\frac{B-1}{B}\sigma^2$,
 \begin{proof}
 The block scale is set to $s = m / q_\text{max} = m/6$.
 After scaling, a small element $w_i \sim \mathcal{N}(0, \sigma^2)$ becomes $w_i / s = 6w_i / m$.
-When $m \gg 6\sigma$, the scaled values $|6w_i / m| \ll 1$ with high probability, so they are rounded to zero.
-The quantization error for each small element is then $w_i^2$.
-In expectation:
+When $m \gg 6\sigma$, we have $|6w_i / m| \ll 1$ with high probability, so the scaled value falls below the smallest non-zero NVFP4 grid point ($0.5$) and is rounded to zero.
+The quantization error for each such element equals $w_i$ itself, giving $\mathbb{E}[(\hat{w}_i - w_i)^2] = \mathbb{E}[w_i^2] = \sigma^2$.
+
+More precisely, the probability that $|6w_i/m| \geq 0.5$ (i.e., $|w_i| \geq m/12$) is $2\Phi(-m/(12\sigma))$, which is exponentially small when $m \gg \sigma$.
+For the elements that do round to zero:
 \begin{equation}
-\mathbb{E}[(\hat{w}_i - w_i)^2] = \mathbb{E}[w_i^2] - \mathbb{E}[(\hat{w}_i)^2] \geq \sigma^2 - \sigma^2 \cdot \frac{q_\text{max}^2 \sigma^2}{m^2} = \sigma^2\!\left(1 - \frac{36\,\sigma^2}{m^2}\right),
+\mathbb{E}[(\hat{w}_i - w_i)^2 \mid \hat{w}_i = 0] = \mathbb{E}[w_i^2] = \sigma^2.
 \end{equation}
-where the second term accounts for the rare event that $|6w_i/m|$ rounds to a nonzero grid point.
-The outlier itself is quantized with relative error $O(2^{-2})$ (one bit of mantissa in E2M1), contributing a small term.
-Averaging over $B$ elements, the block MSE is at least $\frac{B-1}{B}\sigma^2(1 - 36\sigma^2/m^2)$.
+For the rare elements that round to a non-zero grid point, the error is smaller.
+The overall per-element MSE is thus:
+\begin{equation}
+\mathbb{E}[(\hat{w}_i - w_i)^2] \geq \sigma^2\!\left(1 - \frac{q_\text{max}^2 \sigma^2}{m^2}\right),
+\end{equation}
+where the correction term $q_\text{max}^2\sigma^2/m^2 = 36\sigma^2/m^2$ upper bounds the expected quantized signal power.
+The outlier itself is quantized to $\hat{m} = s \cdot q_\text{max} = m$ exactly (it maps to the maximum grid point), contributing zero error.
+Averaging over $B$ elements yields the stated bound.
 \end{proof}
 
-\begin{corollary}
+\begin{corollary}[FP8 is outlier-invariant]
 \label{cor:fp8}
-Under FP8 (E4M3) quantization with per-channel scaling, the same block achieves MSE $\approx \sigma^2 \cdot 2^{-2\cdot 3} = \sigma^2/64$ per element (three mantissa bits), independent of the outlier magnitude $m$, since the per-channel scale accommodates the full dynamic range with 8-bit resolution.
+Under FP8 (E4M3) quantization with per-channel scaling, every element has 3 mantissa bits of precision regardless of dynamic range.
+The per-element MSE is $\approx \sigma^2 \cdot 2^{-2 \times 3} = \sigma^2/64$, independent of the outlier magnitude $m$.
 \end{corollary}
+
+\begin{proposition}[Non-uniform channel sensitivity]
+\label{prop:nonuniform}
+Consider two output channels $j_1, j_2$ with outlier ratios $r_1 = m_1/\sigma_1$ and $r_2 = m_2/\sigma_2$ where $r_1 \gg 1$ and $r_2 \approx 1$.
+Under uniform NVFP4 quantization, channel $j_1$ incurs MSE $\approx \sigma_1^2$ (signal destroyed) while channel $j_2$ achieves MSE $\approx \sigma_2^2/(4q_\text{max}^2) \ll \sigma_2^2$ (normal rounding error).
+Thus, the per-channel output error (Eq.~\ref{eq:output_mse}) varies by a factor of up to $O(q_\text{max}^2 \cdot r_1^2) = O(36 r_1^2)$ across channels.
+Assigning $j_1$ to FP8 (MSE $\approx \sigma_1^2/64$) while keeping $j_2$ at NVFP4 reduces the total distortion at a cost of only $4K$ additional bits.
+\end{proposition}
 
 \begin{remark}
 The ratio of NVFP4-to-FP8 MSE for an outlier-containing channel scales as $O(m^2/\sigma^2)$, which can exceed $10^4$ in practice.
