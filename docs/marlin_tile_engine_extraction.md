@@ -109,6 +109,7 @@ Current progress on this sequence:
   - shared-memory staging for the Marlin-packed `B` tile over one `kBlockK`
     slice
   - `int4` vectorized qweight copies into shared staging
+  - `cp.async`-backed qweight global->shared copies
 - The result is structurally closer to Marlin, but still missing:
   - cp.async-based global->shared staging
   - software pipelining across stages
@@ -117,8 +118,12 @@ Current progress on this sequence:
   kernel. The split-K kernel still uses the scalar/global NVFP4 helper because
   that remains the safer choice for the current best-latency path.
 - The staged qweight loaders now use 16-byte vector copies. This is still not
-  Marlin's `cp.async` path, but it moves the global->shared transfer one step
-  closer to the eventual staged pipeline design.
+  Marlin's full multi-stage pipeline, but the loader itself is now using the
+  same `cp.async` family of primitives instead of plain vector stores.
+- What is still missing relative to Marlin:
+  - multi-stage double buffering
+  - overlapping fetch of the next tile with compute on the current tile
+  - cp.async-based activation/scales staging
 
 ## Why FP8 First
 

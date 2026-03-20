@@ -48,6 +48,37 @@ static __constant__ float c_fp4_lut[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ void cp_async4(void* smem_ptr, const void* glob_ptr) {
+  reinterpret_cast<int4*>(smem_ptr)[0] =
+      reinterpret_cast<const int4*>(glob_ptr)[0];
+}
+
+__device__ __forceinline__ void cp_async_fence() {}
+
+template <int n>
+__device__ __forceinline__ void cp_async_wait() {}
+#else
+__device__ __forceinline__ void cp_async4(void* smem_ptr, const void* glob_ptr) {
+  constexpr int kBytes = 16;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   cp.async.cg.shared.global [%0], [%1], %2;\n"
+      "}\n" ::"r"(smem),
+      "l"(glob_ptr), "n"(kBytes));
+}
+
+__device__ __forceinline__ void cp_async_fence() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int n>
+__device__ __forceinline__ void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+#endif
+
 __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t raw) {
   int sign = (raw >> 7) & 1;
   int exp = (raw >> 3) & 0xF;
@@ -320,8 +351,12 @@ __device__ __forceinline__ void stage_fp8_qweight_k_tile(
     const int local_vec = vec_idx % vecs_per_k_chunk;
     const int global_row_base =
         ((k0 / 16) + kk_block) * fp8_row_stride + tile_word_base;
-    reinterpret_cast<int4*>(sh_fp8_q_tile + kk_block * words_per_k_chunk)[local_vec] =
-        reinterpret_cast<const int4*>(w_fp8_q + global_row_base)[local_vec];
+    void* smem_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<int4*>(sh_fp8_q_tile + kk_block * words_per_k_chunk) +
+        local_vec);
+    const void* glob_ptr = reinterpret_cast<const void*>(
+        reinterpret_cast<const int4*>(w_fp8_q + global_row_base) + local_vec);
+    cp_async4(smem_ptr, glob_ptr);
   }
 }
 
@@ -342,8 +377,12 @@ __device__ __forceinline__ void stage_fp4_qweight_k_tile(
     const int local_vec = vec_idx % vecs_per_k_chunk;
     const int global_row_base =
         ((k0 / 16) + kk_block) * fp4_row_stride + tile_word_base;
-    reinterpret_cast<int4*>(sh_fp4_q_tile + kk_block * words_per_k_chunk)[local_vec] =
-        reinterpret_cast<const int4*>(w_fp4_q + global_row_base)[local_vec];
+    void* smem_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<int4*>(sh_fp4_q_tile + kk_block * words_per_k_chunk) +
+        local_vec);
+    const void* glob_ptr = reinterpret_cast<const void*>(
+        reinterpret_cast<const int4*>(w_fp4_q + global_row_base) + local_vec);
+    cp_async4(smem_ptr, glob_ptr);
   }
 }
 
@@ -488,10 +527,14 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
           fp4_row_stride, k0);
       stage_fp4_scales_k_tile(
           w_fp4_scales, sh_fp4_scales, tile.tile_base, tile.valid_channels, k, k0);
+      cp_async_fence();
+      cp_async_wait<0>();
     } else {
       stage_fp8_qweight_k_tile(
           w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
           fp8_row_stride, k0);
+      cp_async_fence();
+      cp_async_wait<0>();
     }
     __syncthreads();
 
@@ -572,6 +615,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
       stage_fp8_qweight_k_tile(
           w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
           fp8_row_stride, k0);
+      cp_async_fence();
+      cp_async_wait<0>();
     }
     __syncthreads();
 

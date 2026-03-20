@@ -78,6 +78,14 @@ Implemented:
   instead of scalar `int32` copies. This is still short of Marlin's async
   pipeline, but it narrows the gap between the current prototype and Marlin's
   wide staged global->shared transfer pattern.
+- The staged qweight loaders now also issue those 16-byte copies through
+  `cp.async`-family helpers instead of plain vector stores. This is still only
+  a single-stage async copy pattern, not Marlin's full multi-stage pipeline,
+  but it brings the qweight staging path one step closer to Marlin's actual
+  global->shared transfer structure. On the latest RTX 5090 run this helped the
+  base fused path more clearly than the split-K best path, which is consistent
+  with the current split-K bottleneck already being deeper inside the compute
+  loop.
 
 Observed result on RTX 5090:
 
