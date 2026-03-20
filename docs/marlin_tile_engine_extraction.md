@@ -102,6 +102,17 @@ RDQuant already has:
 4. Only after one helper is Marlin-style, revisit block size and shared-memory
    usage.
 
+Current progress on this sequence:
+
+- `FP8` now has:
+  - `half2` fragment multiply/accumulate
+  - shared-memory staging for the Marlin-packed `B` tile over one `kBlockK`
+    slice
+- The result is structurally closer to Marlin, but still missing:
+  - cp.async-based global->shared staging
+  - software pipelining across stages
+  - Marlin's fragment/register blocking
+
 ## Why FP8 First
 
 - `FP8` uses per-channel scale, so the scale path is much simpler than NVFP4.

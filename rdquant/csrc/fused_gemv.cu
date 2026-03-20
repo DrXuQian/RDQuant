@@ -25,6 +25,9 @@ namespace {
 constexpr int kBlockN = 128;
 constexpr int kBlockK = 128;
 constexpr int kThreadsPerBlock = kBlockN;
+constexpr int kQweightTileKChunks = kBlockK / 16;
+constexpr int kFp8WordsPerSubtile = 256;
+constexpr int kFp8MaxWordsPerKTile = kQweightTileKChunks * 2 * kFp8WordsPerSubtile;
 
 enum TileKind : int {
   kTileNVFP4 = 0,
@@ -56,6 +59,10 @@ __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t raw) {
     val = (1.0f + mant * 0.125f) * ldexpf(1.0f, exp - 7);
   }
   return sign ? -val : val;
+}
+
+__device__ __forceinline__ int fp8_words_per_k_chunk(int valid_channels) {
+  return ((valid_channels + 63) / 64) * kFp8WordsPerSubtile;
 }
 
 __device__ __forceinline__ void dequant_fp8_word_to_half2_pairs(
@@ -215,24 +222,24 @@ __device__ __forceinline__ float sum_half2(half2 x) {
 }
 
 __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
-    const int32_t* __restrict__ w_fp8_q,
+    const int32_t* __restrict__ sh_fp8_q_tile,
     const float* __restrict__ w_fp8_scales,
     const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
     int channel,
-    int n_tile,
-    int fp8_row_stride,
-    int k0) {
+    int local_n_tile,
+    int words_per_k_chunk) {
   float acc = 0.0f;
   const half2 scale_h2 = __float2half2_rn(w_fp8_scales[channel]);
 
   #pragma unroll
   for (int kk = 0; kk < kBlockK; kk += 16) {
-    const int row_base = ((k0 + kk) / 16) * fp8_row_stride + n_tile * 256;
+    const int row_base = (kk / 16) * words_per_k_chunk +
+                         local_n_tile * kFp8WordsPerSubtile;
     #pragma unroll
     for (int group = 0; group < 4; ++group) {
       half2 frag_b[2];
-      const int packed = w_fp8_q[row_base + fp8_word_row[group]];
+      const int packed = sh_fp8_q_tile[row_base + fp8_word_row[group]];
       dequant_fp8_word_to_half2_pairs(packed, frag_b);
 
       frag_b[0] = __hmul2(frag_b[0], scale_h2);
@@ -248,6 +255,26 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
   }
 
   return acc;
+}
+
+__device__ __forceinline__ void stage_fp8_qweight_k_tile(
+    const int32_t* __restrict__ w_fp8_q,
+    int32_t* __restrict__ sh_fp8_q_tile,
+    int tile_base,
+    int valid_channels,
+    int fp8_row_stride,
+    int k0) {
+  const int words_per_k_chunk = fp8_words_per_k_chunk(valid_channels);
+  const int total_words = kQweightTileKChunks * words_per_k_chunk;
+  const int tile_word_base = (tile_base / 64) * kFp8WordsPerSubtile;
+
+  for (int word_idx = threadIdx.x; word_idx < total_words; word_idx += blockDim.x) {
+    const int kk_block = word_idx / words_per_k_chunk;
+    const int local_word = word_idx % words_per_k_chunk;
+    const int global_row_base =
+        ((k0 / 16) + kk_block) * fp8_row_stride + tile_word_base;
+    sh_fp8_q_tile[word_idx] = w_fp8_q[global_row_base + local_word];
+  }
 }
 
 // Keep a stable entry point for each dtype path so the mixed scheduler does not
@@ -271,17 +298,16 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile(
 }
 
 __device__ __forceinline__ float run_fp8_qweight_k_tile(
-    const int32_t* __restrict__ w_fp8_q,
+    const int32_t* __restrict__ sh_fp8_q_tile,
     const float* __restrict__ w_fp8_scales,
     const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
     int channel,
-    int n_tile,
-    int fp8_row_stride,
-    int k0) {
+    int local_n_tile,
+    int words_per_k_chunk) {
   return run_fp8_qweight_k_tile_half2(
-      w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, channel, n_tile,
-      fp8_row_stride, k0);
+      sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, channel,
+      local_n_tile, words_per_k_chunk);
 }
 
 __global__ void fused_mixed_gemv_kernel(
@@ -346,6 +372,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
     int n_fp8,
     int k) {
   __shared__ half x_tile[kBlockK];
+  __shared__ int32_t sh_fp8_q_tile[kFp8MaxWordsPerKTile];
 
   TileDesc tile = resolve_tile(blockIdx.x, n_fp4, n_fp8);
   if (tile.valid_channels <= 0) {
@@ -358,6 +385,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
   int fp4_row_stride = n_fp4 * 2;
   int fp8_row_stride = n_fp8 * 4;
   int n_tile = lane_channel / 64;
+  int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
   const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
   const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
@@ -365,6 +393,11 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
 
   for (int k0 = 0; k0 < k; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
+    if (tile.kind == kTileFP8) {
+      stage_fp8_qweight_k_tile(
+          w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
+          fp8_row_stride, k0);
+    }
     __syncthreads();
 
     if (active) {
@@ -375,8 +408,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
             fp4_row_stride, k, k0);
       } else {
         acc += run_fp8_qweight_k_tile(
-            w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
-            n_tile, fp8_row_stride, k0);
+            sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
       }
     }
 
@@ -408,6 +441,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
     int k,
     int parallel_k) {
   __shared__ half x_tile[kBlockK];
+  __shared__ int32_t sh_fp8_q_tile[kFp8MaxWordsPerKTile];
   __shared__ int last_slice_flag;
 
   TileDesc tile = resolve_tile(blockIdx.x, n_fp4, n_fp8);
@@ -431,6 +465,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
   int fp4_row_stride = n_fp4 * 2;
   int fp8_row_stride = n_fp8 * 4;
   int n_tile = lane_channel / 64;
+  int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
   const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
   const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
@@ -438,6 +473,11 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
 
   for (int k0 = k_begin; k0 < k_end; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
+    if (tile.kind == kTileFP8) {
+      stage_fp8_qweight_k_tile(
+          w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
+          fp8_row_stride, k0);
+    }
     __syncthreads();
 
     if (active) {
@@ -448,8 +488,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
             fp4_row_stride, k, k0);
       } else {
         acc += run_fp8_qweight_k_tile(
-            w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
-            n_tile, fp8_row_stride, k0);
+            sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
       }
     }
 

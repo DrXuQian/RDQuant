@@ -62,6 +62,12 @@ Implemented:
   four scalar multiply-adds per packed FP8 word. This is not the full Marlin
   tile engine yet, but it moves the active FP8 backend one step closer to the
   fragment-oriented Marlin compute path.
+- The FP8 path now also stages the Marlin-packed `B` tile for one `kBlockK`
+  slice through shared memory before fragment decode/accumulate. This makes the
+  FP8 helper structurally closer to Marlin's staged `B` path even though the
+  current split-K end-to-end latency is still roughly flat. The main value of
+  this step is establishing the shared `B` staging seam that a later cp.async /
+  software-pipelined FP8 helper can build on.
 
 Observed result on RTX 5090:
 
