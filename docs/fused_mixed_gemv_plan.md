@@ -211,6 +211,18 @@ Observed result on RTX 5090:
   This removes one avoidable source of run-to-run jitter, which matters when
   comparing the two split-K variants because several of the per-layer deltas are
   only on the order of `0.5-1us`.
+- The FP8 helper now has a double-buffered shared->register pipeline inside its
+  `kBlockK=128` inner loop. Concretely, the helper preloads two `16-K`
+  subtiles of packed FP8 words and their corresponding `x` fragments into
+  registers, then alternates between consuming the current register stage and
+  refilling the slot for the subtile two steps ahead. This is a structural move
+  toward Marlin's register pipeline even though the current end-to-end latency
+  impact is still mixed.
+- `cuobjdump --dump-resource-usage` after this change still reports
+  `REG=56` for both split-K kernels, so the new FP8 register pipeline did not
+  increase register count at the kernel level. The remaining bottleneck is
+  therefore more likely to be shared-memory behavior / issue overlap than a
+  simple occupancy collapse from register pressure.
 - A smoke benchmark after extracting those dtype-specific tile entry points
   still passes correctness and preserves the same qualitative ranking:
   split-K remains far ahead of the base fused kernel, so this refactor is a

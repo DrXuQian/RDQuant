@@ -110,6 +110,8 @@ Current progress on this sequence:
     slice
   - `int4` vectorized qweight copies into shared staging
   - `cp.async`-backed qweight global->shared copies
+  - a double-buffered shared->register helper pipeline across the eight
+    `16-K` subtiles inside one `kBlockK=128` slice
 - The result is structurally closer to Marlin, but still missing:
   - cp.async-based global->shared staging
   - software pipelining across stages
@@ -133,6 +135,9 @@ Current progress on this sequence:
   - multi-stage double buffering
   - overlapping fetch of the next tile with compute on the current tile
   - cp.async-based activation/scales staging
+  The new FP8 register pipeline is still only an inner-helper pipeline; it does
+  not yet overlap the global->shared fetch of the next `kBlockK` tile with the
+  compute on the current one.
 
 ## Why FP8 First
 

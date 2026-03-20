@@ -31,6 +31,7 @@ constexpr int kFp8WordsPerSubtile = 256;
 constexpr int kFp4MaxWordsPerKTile = kQweightTileKChunks * 2 * kFp4WordsPerSubtile;
 constexpr int kFp8MaxWordsPerKTile = kQweightTileKChunks * 2 * kFp8WordsPerSubtile;
 constexpr int kFp4MaxScalesPerKTile = kBlockN * kQweightTileKChunks;
+constexpr int kFp8RegisterStages = 2;
 
 enum TileKind : int {
   kTileNVFP4 = 0,
@@ -310,6 +311,50 @@ __device__ __forceinline__ float sum_half2(half2 x) {
   return __half2float(__low2half(x)) + __half2float(__high2half(x));
 }
 
+__device__ __forceinline__ void load_fp8_register_stage(
+    const int32_t* __restrict__ sh_fp8_q_tile,
+    const int32_t* __restrict__ fp8_word_row,
+    const half* __restrict__ x_tile,
+    int local_n_tile,
+    int words_per_k_chunk,
+    int kk,
+    int32_t* __restrict__ packed_stage,
+    half2* __restrict__ x01_stage,
+    half2* __restrict__ x89_stage) {
+  const int row_base = (kk / 16) * words_per_k_chunk +
+                       local_n_tile * kFp8WordsPerSubtile;
+
+  #pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    packed_stage[group] = sh_fp8_q_tile[row_base + fp8_word_row[group]];
+    const int sub = group * 2;
+    x01_stage[group] = __halves2half2(x_tile[kk + sub], x_tile[kk + sub + 1]);
+    x89_stage[group] = __halves2half2(x_tile[kk + sub + 8], x_tile[kk + sub + 9]);
+  }
+}
+
+__device__ __forceinline__ float consume_fp8_register_stage(
+    const int32_t* __restrict__ packed_stage,
+    const half2* __restrict__ x01_stage,
+    const half2* __restrict__ x89_stage,
+    half2 scale_h2) {
+  float acc = 0.0f;
+
+  #pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    half2 frag_b[2];
+    dequant_fp8_word_to_half2_pairs(packed_stage[group], frag_b);
+
+    frag_b[0] = __hmul2(frag_b[0], scale_h2);
+    frag_b[1] = __hmul2(frag_b[1], scale_h2);
+
+    acc += sum_half2(__hmul2(frag_b[0], x01_stage[group]));
+    acc += sum_half2(__hmul2(frag_b[1], x89_stage[group]));
+  }
+
+  return acc;
+}
+
 __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
     const int32_t* __restrict__ sh_fp8_q_tile,
     const float* __restrict__ w_fp8_scales,
@@ -318,28 +363,33 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
     int channel,
     int local_n_tile,
     int words_per_k_chunk) {
-  float acc = 0.0f;
   const half2 scale_h2 = __float2half2_rn(w_fp8_scales[channel]);
+  constexpr int kKSubtiles = kBlockK / 16;
+  int32_t packed_regs[kFp8RegisterStages][4];
+  half2 x01_regs[kFp8RegisterStages][4];
+  half2 x89_regs[kFp8RegisterStages][4];
+  float acc = 0.0f;
+
+  load_fp8_register_stage(
+      sh_fp8_q_tile, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk, 0,
+      packed_regs[0], x01_regs[0], x89_regs[0]);
+  if constexpr (kKSubtiles > 1) {
+    load_fp8_register_stage(
+        sh_fp8_q_tile, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk,
+        16, packed_regs[1], x01_regs[1], x89_regs[1]);
+  }
 
   #pragma unroll
-  for (int kk = 0; kk < kBlockK; kk += 16) {
-    const int row_base = (kk / 16) * words_per_k_chunk +
-                         local_n_tile * kFp8WordsPerSubtile;
-    #pragma unroll
-    for (int group = 0; group < 4; ++group) {
-      half2 frag_b[2];
-      const int packed = sh_fp8_q_tile[row_base + fp8_word_row[group]];
-      dequant_fp8_word_to_half2_pairs(packed, frag_b);
+  for (int kk_block = 0; kk_block < kKSubtiles; ++kk_block) {
+    const int pipe = kk_block % kFp8RegisterStages;
+    acc += consume_fp8_register_stage(
+        packed_regs[pipe], x01_regs[pipe], x89_regs[pipe], scale_h2);
 
-      frag_b[0] = __hmul2(frag_b[0], scale_h2);
-      frag_b[1] = __hmul2(frag_b[1], scale_h2);
-
-      const int sub = group * 2;
-      const half2 x01 = __halves2half2(x_tile[kk + sub], x_tile[kk + sub + 1]);
-      const half2 x89 = __halves2half2(x_tile[kk + sub + 8], x_tile[kk + sub + 9]);
-
-      acc += sum_half2(__hmul2(frag_b[0], x01));
-      acc += sum_half2(__hmul2(frag_b[1], x89));
+    const int next_block = kk_block + kFp8RegisterStages;
+    if (next_block < kKSubtiles) {
+      load_fp8_register_stage(
+          sh_fp8_q_tile, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk,
+          next_block * 16, packed_regs[pipe], x01_regs[pipe], x89_regs[pipe]);
     }
   }
 
