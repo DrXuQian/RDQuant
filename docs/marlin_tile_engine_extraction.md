@@ -164,6 +164,9 @@ Current progress on this sequence:
   shapes (`N_fp8 <= 128`, `K >= 4096`), which matches the current `o_proj` /
   `down_proj` corner without paying that shared-memory cost on the rest of the
   decode layers.
+- The Python benchmark now exposes those two variants directly as `SK16` and
+  `SK32`, instead of only reporting the heuristic-selected `SplitK` column.
+  This makes FP8 chunk heuristic tuning a data problem rather than guesswork.
 - The latest cleanup step hoists FP8 per-channel scale conversion out of the
   split-K chunk helpers. The helper now consumes a precomputed `half2` scale
   instead of reloading/converting it inside every `16-K` or `32-K` chunk. This

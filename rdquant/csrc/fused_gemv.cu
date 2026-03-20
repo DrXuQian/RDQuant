@@ -69,6 +69,7 @@ should_use_wide_fp8_splitk_variant(int n_fp8, int k) {
   return n_fp8 <= 128 && k >= 4096;
 }
 
+
 static __constant__ float c_fp4_lut[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -1137,6 +1138,44 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
 
 }  // namespace
 
+void fused_mixed_gemv_marlin_weights_splitk_narrow_fp8(
+    const void* x,
+    const void* w_fp4_q,
+    const void* w_fp4_scales,
+    float w_fp4_global_scale,
+    const void* w_fp8_q,
+    const void* w_fp8_scales,
+    const void* fp4_word_offsets,
+    const void* fp4_slot_map,
+    const void* fp8_word_offsets,
+    const void* inv_perm,
+    void* workspace,
+    void* tile_counters,
+    void* y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k);
+
+void fused_mixed_gemv_marlin_weights_splitk_wide_fp8(
+    const void* x,
+    const void* w_fp4_q,
+    const void* w_fp4_scales,
+    float w_fp4_global_scale,
+    const void* w_fp8_q,
+    const void* w_fp8_scales,
+    const void* fp4_word_offsets,
+    const void* fp4_slot_map,
+    const void* fp8_word_offsets,
+    const void* inv_perm,
+    void* workspace,
+    void* tile_counters,
+    void* y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k);
+
 void fused_mixed_gemv(
     const void* x,
     const void* w_fp4,
@@ -1223,50 +1262,103 @@ void fused_mixed_gemv_marlin_weights_splitk(
     int n_fp8,
     int k,
     int parallel_k) {
+  if (should_use_wide_fp8_splitk_variant(n_fp8, k)) {
+    fused_mixed_gemv_marlin_weights_splitk_wide_fp8(
+        x, w_fp4_q, w_fp4_scales, w_fp4_global_scale, w_fp8_q, w_fp8_scales,
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets, inv_perm, workspace,
+        tile_counters, y, n_fp4, n_fp8, k, parallel_k);
+  } else {
+    fused_mixed_gemv_marlin_weights_splitk_narrow_fp8(
+        x, w_fp4_q, w_fp4_scales, w_fp4_global_scale, w_fp8_q, w_fp8_scales,
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets, inv_perm, workspace,
+        tile_counters, y, n_fp4, n_fp8, k, parallel_k);
+  }
+}
+
+void fused_mixed_gemv_marlin_weights_splitk_narrow_fp8(
+    const void* x,
+    const void* w_fp4_q,
+    const void* w_fp4_scales,
+    float w_fp4_global_scale,
+    const void* w_fp8_q,
+    const void* w_fp8_scales,
+    const void* fp4_word_offsets,
+    const void* fp4_slot_map,
+    const void* fp8_word_offsets,
+    const void* inv_perm,
+    void* workspace,
+    void* tile_counters,
+    void* y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k) {
   int num_fp4_tiles = (n_fp4 + kBlockN - 1) / kBlockN;
   int num_fp8_tiles = (n_fp8 + kBlockN - 1) / kBlockN;
   dim3 grid(num_fp4_tiles + num_fp8_tiles, parallel_k);
   dim3 block(kThreadsPerBlock);
 
-  if (should_use_wide_fp8_splitk_variant(n_fp8, k)) {
-    fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel<<<grid, block>>>(
-        reinterpret_cast<const half*>(x),
-        reinterpret_cast<const int32_t*>(w_fp4_q),
-        reinterpret_cast<const uint8_t*>(w_fp4_scales),
-        w_fp4_global_scale,
-        reinterpret_cast<const int32_t*>(w_fp8_q),
-        reinterpret_cast<const float*>(w_fp8_scales),
-        reinterpret_cast<const int32_t*>(fp4_word_offsets),
-        reinterpret_cast<const int32_t*>(fp4_slot_map),
-        reinterpret_cast<const int32_t*>(fp8_word_offsets),
-        reinterpret_cast<const int32_t*>(inv_perm),
-        reinterpret_cast<float*>(workspace),
-        reinterpret_cast<int32_t*>(tile_counters),
-        reinterpret_cast<half*>(y),
-        n_fp4,
-        n_fp8,
-        k,
-        parallel_k);
-  } else {
-    fused_mixed_gemv_marlin_qweight_splitk_kernel<<<grid, block>>>(
-        reinterpret_cast<const half*>(x),
-        reinterpret_cast<const int32_t*>(w_fp4_q),
-        reinterpret_cast<const uint8_t*>(w_fp4_scales),
-        w_fp4_global_scale,
-        reinterpret_cast<const int32_t*>(w_fp8_q),
-        reinterpret_cast<const float*>(w_fp8_scales),
-        reinterpret_cast<const int32_t*>(fp4_word_offsets),
-        reinterpret_cast<const int32_t*>(fp4_slot_map),
-        reinterpret_cast<const int32_t*>(fp8_word_offsets),
-        reinterpret_cast<const int32_t*>(inv_perm),
-        reinterpret_cast<float*>(workspace),
-        reinterpret_cast<int32_t*>(tile_counters),
-        reinterpret_cast<half*>(y),
-        n_fp4,
-        n_fp8,
-        k,
-        parallel_k);
-  }
+  fused_mixed_gemv_marlin_qweight_splitk_kernel<<<grid, block>>>(
+      reinterpret_cast<const half*>(x),
+      reinterpret_cast<const int32_t*>(w_fp4_q),
+      reinterpret_cast<const uint8_t*>(w_fp4_scales),
+      w_fp4_global_scale,
+      reinterpret_cast<const int32_t*>(w_fp8_q),
+      reinterpret_cast<const float*>(w_fp8_scales),
+      reinterpret_cast<const int32_t*>(fp4_word_offsets),
+      reinterpret_cast<const int32_t*>(fp4_slot_map),
+      reinterpret_cast<const int32_t*>(fp8_word_offsets),
+      reinterpret_cast<const int32_t*>(inv_perm),
+      reinterpret_cast<float*>(workspace),
+      reinterpret_cast<int32_t*>(tile_counters),
+      reinterpret_cast<half*>(y),
+      n_fp4,
+      n_fp8,
+      k,
+      parallel_k);
+}
+
+void fused_mixed_gemv_marlin_weights_splitk_wide_fp8(
+    const void* x,
+    const void* w_fp4_q,
+    const void* w_fp4_scales,
+    float w_fp4_global_scale,
+    const void* w_fp8_q,
+    const void* w_fp8_scales,
+    const void* fp4_word_offsets,
+    const void* fp4_slot_map,
+    const void* fp8_word_offsets,
+    const void* inv_perm,
+    void* workspace,
+    void* tile_counters,
+    void* y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k) {
+  int num_fp4_tiles = (n_fp4 + kBlockN - 1) / kBlockN;
+  int num_fp8_tiles = (n_fp8 + kBlockN - 1) / kBlockN;
+  dim3 grid(num_fp4_tiles + num_fp8_tiles, parallel_k);
+  dim3 block(kThreadsPerBlock);
+
+  fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel<<<grid, block>>>(
+      reinterpret_cast<const half*>(x),
+      reinterpret_cast<const int32_t*>(w_fp4_q),
+      reinterpret_cast<const uint8_t*>(w_fp4_scales),
+      w_fp4_global_scale,
+      reinterpret_cast<const int32_t*>(w_fp8_q),
+      reinterpret_cast<const float*>(w_fp8_scales),
+      reinterpret_cast<const int32_t*>(fp4_word_offsets),
+      reinterpret_cast<const int32_t*>(fp4_slot_map),
+      reinterpret_cast<const int32_t*>(fp8_word_offsets),
+      reinterpret_cast<const int32_t*>(inv_perm),
+      reinterpret_cast<float*>(workspace),
+      reinterpret_cast<int32_t*>(tile_counters),
+      reinterpret_cast<half*>(y),
+      n_fp4,
+      n_fp8,
+      k,
+      parallel_k);
 }
 
 void fused_mixed_gemv_marlin_weights_splitk_staged_nvfp4(

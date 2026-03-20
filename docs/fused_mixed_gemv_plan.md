@@ -236,6 +236,13 @@ Observed result on RTX 5090:
   - staged-NVFP4 split-K kernel remains `REG=56`, `SHARED=10500`
   and it nudges the current per-layer best-of-two split-K total down slightly
   from roughly `285.1us` to `284.7us` across the 7 target layers.
+- The benchmark now also exposes the two scalar-NVFP4 FP8 chunk variants
+  explicitly:
+  - `SK16`: always force the narrow `16-K` FP8 chunk kernel
+  - `SK32`: always force the wide `32-K` FP8 chunk kernel
+  This is separate from the default `SplitK` column, which still measures the
+  current runtime heuristic. The explicit columns make it possible to tune the
+  FP8 chunk heuristic using data rather than inference.
 - The main split-K FP8 path now uses a lighter overlap scheme at `16-K` chunk
   granularity instead of double-buffering an entire `kBlockK=128` qweight tile.
   Concretely, each loop iteration stages one `16-K` FP8 chunk into shared,

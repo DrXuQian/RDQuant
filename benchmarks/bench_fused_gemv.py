@@ -531,8 +531,8 @@ def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
     print("=" * 60)
     print(f"{'Layer':<14} {'N':>6} {'K':>6} {'N4':>5} {'N8':>5} "
           f"{'cuBLAS':>8} {'Mrl4':>8} {'Mrl8':>8} {'M4+8':>8} {'2xMrl':>8} "
-          f"{'Base':>8} {'SplitK':>8} {'Split4S':>8} {'AutoSK':>8} {'BestSK':>8} {'P_K':>5} {'Mode':>8}")
-    print("-" * 176)
+          f"{'Base':>8} {'SplitK':>8} {'SK16':>8} {'SK32':>8} {'Split4S':>8} {'AutoSK':>8} {'BestSK':>8} {'P_K':>5} {'Mode':>8}")
+    print("-" * 194)
 
     fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps()
 
@@ -602,6 +602,32 @@ def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
             inv_perm, workspace, tile_counters,
             N_fp4, N_fp8, K, parallel_k
         ), warmup=warmup, repeat=repeat)
+        workspace_narrow = torch.zeros_like(workspace)
+        tile_counters_narrow = torch.zeros_like(tile_counters)
+        t_splitk_narrow = bench(
+            lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_narrow_fp8(
+                x_fp16, w_fp4_q, w_fp4_scales, 1.0,
+                w_fp8_q, w_fp8_scales,
+                fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+                inv_perm, workspace_narrow, tile_counters_narrow,
+                N_fp4, N_fp8, K, parallel_k
+            ),
+            warmup=warmup,
+            repeat=repeat,
+        )
+        workspace_wide = torch.zeros_like(workspace)
+        tile_counters_wide = torch.zeros_like(tile_counters)
+        t_splitk_wide = bench(
+            lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_wide_fp8(
+                x_fp16, w_fp4_q, w_fp4_scales, 1.0,
+                w_fp8_q, w_fp8_scales,
+                fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+                inv_perm, workspace_wide, tile_counters_wide,
+                N_fp4, N_fp8, K, parallel_k
+            ),
+            warmup=warmup,
+            repeat=repeat,
+        )
         workspace_staged = torch.zeros_like(workspace)
         tile_counters_staged = torch.zeros_like(tile_counters)
         t_splitk_staged = bench(
@@ -628,12 +654,19 @@ def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
             warmup=warmup,
             repeat=repeat,
         )
-        best_splitk = min(t_splitk, t_splitk_staged)
-        best_mode = "scalar" if t_splitk <= t_splitk_staged else "stg4"
+        variants = {
+            "heur": t_splitk,
+            "n16": t_splitk_narrow,
+            "w32": t_splitk_wide,
+            "stg4": t_splitk_staged,
+            "auto": t_splitk_auto,
+        }
+        best_mode, best_splitk = min(variants.items(), key=lambda kv: kv[1])
         print(f"{name:<14} {N:>6} {K:>6} {N_fp4:>5} {N_fp8:>5} "
               f"{t_cublas:>7.1f}us {t_marlin_fp4:>7.1f}us {t_marlin_fp8:>7.1f}us "
               f"{t_marlin_sum:>7.1f}us {t_marlin:>7.1f}us {t_fused:>7.1f}us "
-              f"{t_splitk:>7.1f}us {t_splitk_staged:>8.1f}us {t_splitk_auto:>8.1f}us {best_splitk:>8.1f}us "
+              f"{t_splitk:>7.1f}us {t_splitk_narrow:>7.1f}us {t_splitk_wide:>7.1f}us "
+              f"{t_splitk_staged:>8.1f}us {t_splitk_auto:>8.1f}us {best_splitk:>8.1f}us "
               f"{parallel_k:>5} {best_mode:>8}")
 
     print()
