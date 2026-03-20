@@ -47,6 +47,14 @@ Implemented:
 - Runtime checks in [`rdquant/csrc/bindings.cpp`](../rdquant/csrc/bindings.cpp)
 - A benchmark script aligned to the 7 target layer shapes in
   [`benchmarks/bench_fused_gemv.py`](../benchmarks/bench_fused_gemv.py)
+- The scalar Marlin-qweight inner loops have now been extracted into explicit
+  dtype-specific device entry points inside
+  [`rdquant/csrc/fused_gemv.cu`](../rdquant/csrc/fused_gemv.cu):
+  - `run_nvfp4_qweight_k_tile(...)`
+  - `run_fp8_qweight_k_tile(...)`
+  This does not change the algorithm yet, but it gives the mixed scheduler a
+  clean seam where the current scalar decode path can be replaced with a
+  Marlin-style tile engine without rewriting the outer split-K scheduler again.
 
 Observed result on RTX 5090:
 
@@ -140,6 +148,10 @@ Observed result on RTX 5090:
   this prototype; on the current sweep it is already the best-performing choice.
   That makes the remaining bottleneck much more clearly an inner-loop issue than
   an outer scheduling issue.
+- A smoke benchmark after extracting those dtype-specific tile entry points
+  still passes correctness and preserves the same qualitative ranking:
+  split-K remains far ahead of the base fused kernel, so this refactor is a
+  clean structural step toward swapping in a Marlin tile engine.
 - `cuobjdump --dump-resource-usage` for the split-K kernel reports:
   - `REG=56`
   - `SHARED=1284`

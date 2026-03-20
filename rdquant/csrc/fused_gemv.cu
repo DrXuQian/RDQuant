@@ -170,6 +170,87 @@ __device__ __forceinline__ float run_fp8_tile(
   return acc;
 }
 
+__device__ __forceinline__ float run_nvfp4_qweight_k_tile(
+    const int32_t* __restrict__ w_fp4_q,
+    const uint8_t* __restrict__ w_fp4_scales,
+    float w_fp4_global_scale,
+    const int32_t* __restrict__ fp4_word_row,
+    const int32_t* __restrict__ fp4_slot_row,
+    const half* __restrict__ x_tile,
+    int channel,
+    int n_tile,
+    int fp4_row_stride,
+    int k,
+    int k0) {
+  float acc = 0.0f;
+
+  #pragma unroll
+  for (int kk = 0; kk < kBlockK; kk += 16) {
+    int row_base = ((k0 + kk) / 16) * fp4_row_stride + n_tile * 128;
+    float scale = fp8_e4m3_to_float(
+        w_fp4_scales[channel * (k / 16) + (k0 + kk) / 16]) *
+        w_fp4_global_scale;
+    #pragma unroll
+    for (int group = 0; group < 4; ++group) {
+      int packed = w_fp4_q[row_base + fp4_word_row[group]];
+      const int32_t* slot_group = fp4_slot_row + group * 4;
+
+      int sub = group * 2;
+      acc += c_fp4_lut[(packed >> (4 * slot_group[0])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub]);
+      acc += c_fp4_lut[(packed >> (4 * slot_group[1])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub + 1]);
+      acc += c_fp4_lut[(packed >> (4 * slot_group[2])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub + 8]);
+      acc += c_fp4_lut[(packed >> (4 * slot_group[3])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub + 9]);
+    }
+  }
+
+  return acc;
+}
+
+__device__ __forceinline__ float run_fp8_qweight_k_tile(
+    const int32_t* __restrict__ w_fp8_q,
+    const float* __restrict__ w_fp8_scales,
+    const int32_t* __restrict__ fp8_word_row,
+    const half* __restrict__ x_tile,
+    int channel,
+    int n_tile,
+    int fp8_row_stride,
+    int k0) {
+  float acc = 0.0f;
+  float channel_scale = w_fp8_scales[channel];
+
+  #pragma unroll
+  for (int kk = 0; kk < kBlockK; kk += 16) {
+    int row_base = ((k0 + kk) / 16) * fp8_row_stride + n_tile * 256;
+    #pragma unroll
+    for (int group = 0; group < 4; ++group) {
+      half2 frag_b[2];
+      int packed = w_fp8_q[row_base + fp8_word_row[group]];
+      dequant_fp8_word_to_half2_pairs(packed, frag_b);
+
+      int sub = group * 2;
+      half x0 = x_tile[kk + sub];
+      half x1 = x_tile[kk + sub + 1];
+      half x8 = x_tile[kk + sub + 8];
+      half x9 = x_tile[kk + sub + 9];
+
+      acc += __half2float(__low2half(frag_b[0])) * __half2float(x0) *
+             channel_scale;
+      acc += __half2float(__high2half(frag_b[0])) * __half2float(x1) *
+             channel_scale;
+      acc += __half2float(__low2half(frag_b[1])) * __half2float(x8) *
+             channel_scale;
+      acc += __half2float(__high2half(frag_b[1])) * __half2float(x9) *
+             channel_scale;
+    }
+  }
+
+  return acc;
+}
+
 __global__ void fused_mixed_gemv_kernel(
     const half* __restrict__ x,
     const uint8_t* __restrict__ w_fp4,
@@ -255,51 +336,14 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
 
     if (active) {
       if (tile.kind == kTileNVFP4) {
-        #pragma unroll
-        for (int kk = 0; kk < kBlockK; kk += 16) {
-          int row_base = ((k0 + kk) / 16) * fp4_row_stride + n_tile * 128;
-          float scale = fp8_e4m3_to_float(
-              w_fp4_scales[lane_channel * (k / 16) + (k0 + kk) / 16]) *
-              w_fp4_global_scale;
-          #pragma unroll
-          for (int group = 0; group < 4; ++group) {
-            int packed = w_fp4_q[row_base + fp4_word_row[group]];
-            const int32_t* slot_group = fp4_slot_row + group * 4;
-
-            int sub = group * 2;
-            acc += c_fp4_lut[(packed >> (4 * slot_group[0])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub]);
-            acc += c_fp4_lut[(packed >> (4 * slot_group[1])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub + 1]);
-            acc += c_fp4_lut[(packed >> (4 * slot_group[2])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub + 8]);
-            acc += c_fp4_lut[(packed >> (4 * slot_group[3])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub + 9]);
-          }
-        }
+        acc += run_nvfp4_qweight_k_tile(
+            w_fp4_q, w_fp4_scales, w_fp4_global_scale,
+            fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
+            fp4_row_stride, k, k0);
       } else {
-        float channel_scale = w_fp8_scales[lane_channel];
-        #pragma unroll
-        for (int kk = 0; kk < kBlockK; kk += 16) {
-          int row_base = ((k0 + kk) / 16) * fp8_row_stride + n_tile * 256;
-          #pragma unroll
-          for (int group = 0; group < 4; ++group) {
-            half2 frag_b[2];
-            int packed = w_fp8_q[row_base + fp8_word_row[group]];
-            dequant_fp8_word_to_half2_pairs(packed, frag_b);
-
-            int sub = group * 2;
-            half x0 = x_tile[kk + sub];
-            half x1 = x_tile[kk + sub + 1];
-            half x8 = x_tile[kk + sub + 8];
-            half x9 = x_tile[kk + sub + 9];
-
-            acc += __half2float(__low2half(frag_b[0])) * __half2float(x0) * channel_scale;
-            acc += __half2float(__high2half(frag_b[0])) * __half2float(x1) * channel_scale;
-            acc += __half2float(__low2half(frag_b[1])) * __half2float(x8) * channel_scale;
-            acc += __half2float(__high2half(frag_b[1])) * __half2float(x9) * channel_scale;
-          }
-        }
+        acc += run_fp8_qweight_k_tile(
+            w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            n_tile, fp8_row_stride, k0);
       }
     }
 
@@ -365,51 +409,14 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
 
     if (active) {
       if (tile.kind == kTileNVFP4) {
-        #pragma unroll
-        for (int kk = 0; kk < kBlockK; kk += 16) {
-          int row_base = ((k0 + kk) / 16) * fp4_row_stride + n_tile * 128;
-          float scale = fp8_e4m3_to_float(
-              w_fp4_scales[lane_channel * (k / 16) + (k0 + kk) / 16]) *
-              w_fp4_global_scale;
-          #pragma unroll
-          for (int group = 0; group < 4; ++group) {
-            int packed = w_fp4_q[row_base + fp4_word_row[group]];
-            const int32_t* slot_group = fp4_slot_row + group * 4;
-
-            int sub = group * 2;
-            acc += c_fp4_lut[(packed >> (4 * slot_group[0])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub]);
-            acc += c_fp4_lut[(packed >> (4 * slot_group[1])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub + 1]);
-            acc += c_fp4_lut[(packed >> (4 * slot_group[2])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub + 8]);
-            acc += c_fp4_lut[(packed >> (4 * slot_group[3])) & 0xF] *
-                   scale * __half2float(x_tile[kk + sub + 9]);
-          }
-        }
+        acc += run_nvfp4_qweight_k_tile(
+            w_fp4_q, w_fp4_scales, w_fp4_global_scale,
+            fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
+            fp4_row_stride, k, k0);
       } else {
-        float channel_scale = w_fp8_scales[lane_channel];
-        #pragma unroll
-        for (int kk = 0; kk < kBlockK; kk += 16) {
-          int row_base = ((k0 + kk) / 16) * fp8_row_stride + n_tile * 256;
-          #pragma unroll
-          for (int group = 0; group < 4; ++group) {
-            half2 frag_b[2];
-            int packed = w_fp8_q[row_base + fp8_word_row[group]];
-            dequant_fp8_word_to_half2_pairs(packed, frag_b);
-
-            int sub = group * 2;
-            half x0 = x_tile[kk + sub];
-            half x1 = x_tile[kk + sub + 1];
-            half x8 = x_tile[kk + sub + 8];
-            half x9 = x_tile[kk + sub + 9];
-
-            acc += __half2float(__low2half(frag_b[0])) * __half2float(x0) * channel_scale;
-            acc += __half2float(__high2half(frag_b[0])) * __half2float(x1) * channel_scale;
-            acc += __half2float(__low2half(frag_b[1])) * __half2float(x8) * channel_scale;
-            acc += __half2float(__high2half(frag_b[1])) * __half2float(x9) * channel_scale;
-          }
-        }
+        acc += run_fp8_qweight_k_tile(
+            w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            n_tile, fp8_row_stride, k0);
       }
     }
 
