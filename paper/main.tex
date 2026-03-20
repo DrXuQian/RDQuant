@@ -260,6 +260,38 @@ Channels without outliers (small $m/\sigma$) can remain at NVFP4 with negligible
 The optimal assignment depends on the \emph{marginal rate--distortion tradeoff}: whether the distortion reduction from upgrading a channel to FP8 justifies the $4$-bit cost.
 \end{remark}
 
+\paragraph{Empirical verification on Qwen3-4B.}
+Table~\ref{tab:sensitivity_data} validates the above propositions on real model weights.
+We compute per-channel NVFP4 and FP8 MSE across all 252 linear layers (1.1M output channels) of Qwen3-4B.
+
+\begin{table}[t]
+\centering
+\caption{Empirical channel sensitivity statistics on Qwen3-4B. CV is the coefficient of variation (std/mean) of per-channel NVFP4 MSE within each layer. Higher CV means greater heterogeneity across channels, validating the need for per-channel format assignment.}
+\label{tab:sensitivity_data}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Statistic} & \textbf{Min} & \textbf{Mean} & \textbf{Max} \\
+\midrule
+Intra-layer NVFP4 MSE CV & 0.08 & 0.30 & 0.89 \\
+Intra-layer max/min MSE ratio & 3.5$\times$ & 29.4$\times$ & 92.9$\times$ \\
+NVFP4/FP8 MSE ratio per layer & 14$\times$ & 64$\times$ & 1505$\times$ \\
+Outlier ratio ($\max|w|/\mathrm{std}$) & 3.0 & 4.8 & 33.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key observations: (i) The intra-layer NVFP4 MSE coefficient of variation reaches 0.89 for \texttt{q\_proj} layers, confirming that channels within a single layer have vastly different quantization errors.
+(ii) The worst-case intra-layer MSE ratio is 93$\times$, meaning the hardest channel has 93$\times$ more error than the easiest under uniform NVFP4.
+(iii) The NVFP4/FP8 MSE ratio reaches 1505$\times$ for certain layers, validating Corollary~\ref{cor:fp8}: FP8 with per-channel scaling is orders of magnitude better for outlier-heavy channels.
+(iv) Interestingly, the Spearman correlation between the simple outlier ratio $r = \max|w|/\mathrm{std}(w)$ and per-channel MSE is weak ($\rho = -0.03$), because MSE depends on the full \emph{block-level} distribution, not just the single largest element.
+This validates our approach of using direct MSE computation in R-D allocation rather than heuristic outlier metrics.
+
+\paragraph{Layer-type sensitivity patterns.}
+Figure~\ref{fig:allocation} reveals systematic patterns: \texttt{down\_proj} layers are consistently allocated to NVFP4 (low sensitivity, avg 4.1 bpw), while \texttt{v\_proj} and \texttt{gate\_proj} layers receive more FP8 channels (higher sensitivity).
+The per-layer calibrated importance (Figure~\ref{fig:importance}) shows that weight MSE importance varies non-monotonically across layers, unlike activation norm which grows monotonically due to residual stream accumulation---a factor of $14{,}000\times$ between the first and last layers.
+The perturb-based calibration reveals that \texttt{layers.2.mlp.gate\_proj} is the most sensitive layer (importance = 94.7), while \texttt{layers.35.self\_attn.v\_proj} is nearly insensitive (importance $\approx 0$)---the opposite of what activation norm predicts.
+
 
 \begin{figure}[t]
 \centering
@@ -602,6 +634,52 @@ FP16 cuBLAS & 74.2 & $1.0\times$ \\
 \end{table}
 
 The vLLM Marlin kernels are $3.4\times$ faster than FP16 cuBLAS at $M=1$, making them the clear choice for decode.
+Notably, NVFP4 and FP8 Marlin have nearly identical latency (21.5 vs 21.6\,$\mu$s), both hitting the $\sim$21\,$\mu$s kernel launch overhead floor.
+The cuBLASLt native FP4$\times$FP4 and MXFP8$\times$MXFP8 kernels are substantially slower due to higher launch overhead (designed for large batch sizes) and incompatible with weight-only quantization (requiring activation quantization).
+
+\paragraph{CUDA kernel profiling.}
+Profiling a full forward pass with \texttt{torch.profiler} reveals the kernel-level time breakdown:
+
+\begin{table}[t]
+\centering
+\caption{CUDA kernel time breakdown for a full Qwen3-4B forward pass (SEQ=128).}
+\label{tab:kernel_profile}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Component} & \textbf{BF16} & \textbf{RDQuant} & \textbf{\% of total} \\
+\midrule
+GEMM kernels & 7.6\,ms & 12.2\,ms & 64\% \\
+Scatter/gather (inv\_perm) & --- & 1.4\,ms & 7\% \\
+Elementwise (cat, add, etc.) & 1.8\,ms & 2.6\,ms & 14\% \\
+Flash attention & 0.4\,ms & 0.4\,ms & 2\% \\
+Other & 1.9\,ms & 2.5\,ms & 13\% \\
+\midrule
+\textbf{Total CUDA time} & \textbf{11.7\,ms} & \textbf{19.1\,ms} & \textbf{100\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 2$\times$ Marlin GEMM time (12.2\,ms) accounts for 64\% of the total CUDA time.
+With CUDA Graph capture (18.9\,ms end-to-end), the measured latency closely matches the pure CUDA time (19.1\,ms), confirming that Python dispatch overhead is fully eliminated.
+
+\paragraph{Theoretical decode speedup.}
+For decode ($M$=1), latency is dominated by weight memory bandwidth. The RTX 5090's HBM delivers $\sim$1.8\,TB/s.
+\begin{table}[t]
+\centering
+\caption{Theoretical decode latency from bandwidth model (RTX 5090, 1.8\,TB/s).}
+\label{tab:bandwidth_model}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Method} & \textbf{Weight (MB)} & \textbf{BW time ($\mu$s)} & \textbf{vs BF16} \\
+\midrule
+BF16 & 49.8 & 27.7 & 1.0$\times$ \\
+RDQuant 5.3 bpw & 17.8 & 9.9 & 2.8$\times$ \\
+Uniform NVFP4 & 14.0 & 7.8 & 3.6$\times$ \\
+Uniform FP8 & 24.9 & 13.8 & 2.0$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+The measured 2.59$\times$ decode speedup is close to the theoretical 2.8$\times$ from the bandwidth model, indicating that the Marlin kernels achieve near-peak memory throughput.
 Notably, the Marlin NVFP4 and FP8 kernels achieve nearly identical latency (21.5 vs.\ 21.6\,$\mu$s), indicating that at $M=1$ both are purely bandwidth-bound and the $2\times$ difference in format width is compensated by the Marlin kernel's dequantization-during-load strategy.
 The cuBLASLt kernels for W4A4 and W8A8 are actually \emph{slower} than FP16, likely because they target compute-bound scenarios ($M \gg 1$) and have higher launch overhead.
 
