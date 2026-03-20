@@ -115,8 +115,12 @@ Current progress on this sequence:
   - software pipelining across stages
   - Marlin's fragment/register blocking
 - `NVFP4` now also has a staged-qweight/staged-scale version in the base fused
-  kernel. The split-K kernel still uses the scalar/global NVFP4 helper because
-  that remains the safer choice for the current best-latency path.
+  kernel.
+- The split-K path is now benchmarked in two forms:
+  - the original scalar/global NVFP4 helper path
+  - an alternate staged-NVFP4 path
+  The staged-NVFP4 variant is not a uniform win, so both are kept visible in
+  the benchmark instead of prematurely replacing the previous best path.
 - The staged qweight loaders now use 16-byte vector copies. This is still not
   Marlin's full multi-stage pipeline, but the loader itself is now using the
   same `cp.async` family of primitives instead of plain vector stores.

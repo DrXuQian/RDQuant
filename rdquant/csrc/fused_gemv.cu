@@ -498,9 +498,11 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
     int n_fp8,
     int k) {
   __shared__ half x_tile[kBlockK];
-  __shared__ int32_t sh_fp4_q_tile[kFp4MaxWordsPerKTile];
+  __shared__ union {
+    int32_t fp4_q[kFp4MaxWordsPerKTile];
+    int32_t fp8_q[kFp8MaxWordsPerKTile];
+  } sh_q_tile;
   __shared__ uint8_t sh_fp4_scales[kFp4MaxScalesPerKTile];
-  __shared__ int32_t sh_fp8_q_tile[kFp8MaxWordsPerKTile];
 
   TileDesc tile = resolve_tile(blockIdx.x, n_fp4, n_fp8);
   if (tile.valid_channels <= 0) {
@@ -523,7 +525,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
     stage_x_tile<kBlockK>(x, k0, x_tile);
     if (tile.kind == kTileNVFP4) {
       stage_fp4_qweight_k_tile(
-          w_fp4_q, sh_fp4_q_tile, tile.tile_base, tile.valid_channels,
+          w_fp4_q, sh_q_tile.fp4_q, tile.tile_base, tile.valid_channels,
           fp4_row_stride, k0);
       stage_fp4_scales_k_tile(
           w_fp4_scales, sh_fp4_scales, tile.tile_base, tile.valid_channels, k, k0);
@@ -531,7 +533,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
       cp_async_wait<0>();
     } else {
       stage_fp8_qweight_k_tile(
-          w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
+          w_fp8_q, sh_q_tile.fp8_q, tile.tile_base, tile.valid_channels,
           fp8_row_stride, k0);
       cp_async_fence();
       cp_async_wait<0>();
@@ -541,12 +543,12 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
     if (active) {
       if (tile.kind == kTileNVFP4) {
         acc += run_nvfp4_qweight_k_tile(
-            sh_fp4_q_tile, sh_fp4_scales, w_fp4_global_scale,
+            sh_q_tile.fp4_q, sh_fp4_scales, w_fp4_global_scale,
             fp4_word_row, fp4_slot_row, x_tile, local_channel, local_n_tile,
             fp4_words_per_k_chunk(tile.valid_channels));
       } else {
         acc += run_fp8_qweight_k_tile(
-            sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            sh_q_tile.fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
             local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
       }
     }
@@ -629,6 +631,121 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
       } else {
         acc += run_fp8_qweight_k_tile(
             sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
+      }
+    }
+
+    __syncthreads();
+  }
+
+  if (active) {
+    atomicAdd(workspace + tile.logical_base + threadIdx.x, acc);
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    int prev = atomicAdd(tile_counters + blockIdx.x, 1);
+    last_slice_flag = (prev + 1 == parallel_k) ? 1 : 0;
+  }
+  __syncthreads();
+
+  if (last_slice_flag) {
+    if (active) {
+      int logical_idx = tile.logical_base + threadIdx.x;
+      float total = workspace[logical_idx];
+      int out_idx = inv_perm[logical_idx];
+      y[out_idx] = __float2half(total);
+      workspace[logical_idx] = 0.0f;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      tile_counters[blockIdx.x] = 0;
+    }
+  }
+}
+
+__global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
+    const half* __restrict__ x,
+    const int32_t* __restrict__ w_fp4_q,
+    const uint8_t* __restrict__ w_fp4_scales,
+    float w_fp4_global_scale,
+    const int32_t* __restrict__ w_fp8_q,
+    const float* __restrict__ w_fp8_scales,
+    const int32_t* __restrict__ fp4_word_offsets,
+    const int32_t* __restrict__ fp4_slot_map,
+    const int32_t* __restrict__ fp8_word_offsets,
+    const int32_t* __restrict__ inv_perm,
+    float* __restrict__ workspace,
+    int32_t* __restrict__ tile_counters,
+    half* __restrict__ y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k) {
+  __shared__ half x_tile[kBlockK];
+  __shared__ union {
+    int32_t fp4_q[kFp4MaxWordsPerKTile];
+    int32_t fp8_q[kFp8MaxWordsPerKTile];
+  } sh_q_tile;
+  __shared__ uint8_t sh_fp4_scales[kFp4MaxScalesPerKTile];
+  __shared__ int last_slice_flag;
+
+  TileDesc tile = resolve_tile(blockIdx.x, n_fp4, n_fp8);
+  if (tile.valid_channels <= 0) {
+    return;
+  }
+
+  int total_k_tiles = k / kBlockK;
+  int slice_id = blockIdx.y;
+  int slice_tile_begin = (total_k_tiles * slice_id) / parallel_k;
+  int slice_tile_end = (total_k_tiles * (slice_id + 1)) / parallel_k;
+  if (slice_tile_begin >= slice_tile_end) {
+    return;
+  }
+  int k_begin = slice_tile_begin * kBlockK;
+  int k_end = slice_tile_end * kBlockK;
+
+  int lane_channel = tile.tile_base + threadIdx.x;
+  bool active = threadIdx.x < tile.valid_channels;
+  float acc = 0.0f;
+  int fp4_row_stride = n_fp4 * 2;
+  int fp8_row_stride = n_fp8 * 4;
+  int local_channel = threadIdx.x;
+  int local_n_tile = threadIdx.x / 64;
+  int n_in_tile = lane_channel % 64;
+  const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
+  const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
+  const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+
+  for (int k0 = k_begin; k0 < k_end; k0 += kBlockK) {
+    stage_x_tile<kBlockK>(x, k0, x_tile);
+    if (tile.kind == kTileNVFP4) {
+      stage_fp4_qweight_k_tile(
+          w_fp4_q, sh_q_tile.fp4_q, tile.tile_base, tile.valid_channels,
+          fp4_row_stride, k0);
+      stage_fp4_scales_k_tile(
+          w_fp4_scales, sh_fp4_scales, tile.tile_base, tile.valid_channels, k, k0);
+      cp_async_fence();
+      cp_async_wait<0>();
+    } else {
+      stage_fp8_qweight_k_tile(
+          w_fp8_q, sh_q_tile.fp8_q, tile.tile_base, tile.valid_channels,
+          fp8_row_stride, k0);
+      cp_async_fence();
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    if (active) {
+      if (tile.kind == kTileNVFP4) {
+        acc += run_nvfp4_qweight_k_tile(
+            sh_q_tile.fp4_q, sh_fp4_scales, w_fp4_global_scale,
+            fp4_word_row, fp4_slot_row, x_tile, local_channel, local_n_tile,
+            fp4_words_per_k_chunk(tile.valid_channels));
+      } else {
+        acc += run_fp8_qweight_k_tile(
+            sh_q_tile.fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
             local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
       }
     }
@@ -757,6 +874,49 @@ void fused_mixed_gemv_marlin_weights_splitk(
   dim3 block(kThreadsPerBlock);
 
   fused_mixed_gemv_marlin_qweight_splitk_kernel<<<grid, block>>>(
+      reinterpret_cast<const half*>(x),
+      reinterpret_cast<const int32_t*>(w_fp4_q),
+      reinterpret_cast<const uint8_t*>(w_fp4_scales),
+      w_fp4_global_scale,
+      reinterpret_cast<const int32_t*>(w_fp8_q),
+      reinterpret_cast<const float*>(w_fp8_scales),
+      reinterpret_cast<const int32_t*>(fp4_word_offsets),
+      reinterpret_cast<const int32_t*>(fp4_slot_map),
+      reinterpret_cast<const int32_t*>(fp8_word_offsets),
+      reinterpret_cast<const int32_t*>(inv_perm),
+      reinterpret_cast<float*>(workspace),
+      reinterpret_cast<int32_t*>(tile_counters),
+      reinterpret_cast<half*>(y),
+      n_fp4,
+      n_fp8,
+      k,
+      parallel_k);
+}
+
+void fused_mixed_gemv_marlin_weights_splitk_staged_nvfp4(
+    const void* x,
+    const void* w_fp4_q,
+    const void* w_fp4_scales,
+    float w_fp4_global_scale,
+    const void* w_fp8_q,
+    const void* w_fp8_scales,
+    const void* fp4_word_offsets,
+    const void* fp4_slot_map,
+    const void* fp8_word_offsets,
+    const void* inv_perm,
+    void* workspace,
+    void* tile_counters,
+    void* y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k) {
+  int num_fp4_tiles = (n_fp4 + kBlockN - 1) / kBlockN;
+  int num_fp8_tiles = (n_fp8 + kBlockN - 1) / kBlockN;
+  dim3 grid(num_fp4_tiles + num_fp8_tiles, parallel_k);
+  dim3 block(kThreadsPerBlock);
+
+  fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel<<<grid, block>>>(
       reinterpret_cast<const half*>(x),
       reinterpret_cast<const int32_t*>(w_fp4_q),
       reinterpret_cast<const uint8_t*>(w_fp4_scales),

@@ -86,6 +86,14 @@ Implemented:
   base fused path more clearly than the split-K best path, which is consistent
   with the current split-K bottleneck already being deeper inside the compute
   loop.
+- The split-K path is now exposed in two explicit variants:
+  - the original best path where `NVFP4` still uses the scalar/global helper
+  - an alternate `staged NVFP4` path where both dtype groups stage qweights
+    through shared memory before the mixed inner loop
+  Benchmarking them side by side is important because the staged NVFP4 path is
+  not a uniform win: it helps some low-tile-count shapes (`k_proj`, `v_proj`,
+  `down_proj`) but regresses others. The current benchmark now prints both
+  variants and a per-layer `BestSK` result instead of forcing one policy.
 
 Observed result on RTX 5090:
 
@@ -179,6 +187,19 @@ Observed result on RTX 5090:
   this prototype; on the current sweep it is already the best-performing choice.
   That makes the remaining bottleneck much more clearly an inner-loop issue than
   an outer scheduling issue.
+- With the split-K benchmark now reporting both the original scalar-NVFP4 path
+  and the staged-NVFP4 alternate path, the current per-layer best-of-two on
+  RTX 5090 is approximately:
+  - `q_proj`: `31.0us` (scalar)
+  - `k_proj`: `21.4us` (staged NVFP4)
+  - `v_proj`: `20.2us` (staged NVFP4)
+  - `o_proj`: `35.8us` (scalar)
+  - `gate_proj`: `43.6us` (scalar)
+  - `up_proj`: `61.8us` (scalar)
+  - `down_proj`: `63.2us` (staged NVFP4)
+  This gives a current best-of-two total of roughly `277us` across the 7 target
+  layers, which is modestly better than forcing the original split-K path on
+  every layer.
 - A smoke benchmark after extracting those dtype-specific tile entry points
   still passes correctness and preserves the same qualitative ranking:
   split-K remains far ahead of the base fused kernel, so this refactor is a
