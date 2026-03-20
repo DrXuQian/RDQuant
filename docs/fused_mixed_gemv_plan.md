@@ -40,23 +40,111 @@ Implemented:
   - CTA-level dispatch between `NVFP4` and `FP8`
   - shared-memory staging for the activation tile
   - `inv_perm` scatter in the epilogue
+- A second transition path in the same file that consumes Marlin-repacked
+  qweights (`[K/16, N*2]` for NVFP4 and `[K/16, N*4]` for FP8) while still
+  using plain scales. This validates the mixed scheduler and qweight address
+  formulas independently of Marlin's full inner loop.
 - Runtime checks in [`rdquant/csrc/bindings.cpp`](../rdquant/csrc/bindings.cpp)
 - A benchmark script aligned to the 7 target layer shapes in
   [`benchmarks/bench_fused_gemv.py`](../benchmarks/bench_fused_gemv.py)
 
 Observed result on RTX 5090:
 
-- Correctness passes for the tiled prototype.
+- Correctness passes for both:
+  - the row-major tiled prototype
+  - the Marlin-qweight transition path
 - Performance is still far from target because it still consumes row-major
-  fake-quant tensors and uses scalar decode paths.
+  fake-quant tensors or scalar per-element Marlin-qweight decode paths.
 - Representative numbers from `python benchmarks/bench_fused_gemv.py`:
-  - `q_proj`: cuBLAS `20.8us`, tiled prototype `390.6us`
-  - `o_proj`: cuBLAS `19.9us`, tiled prototype `593.9us`
-  - `down_proj`: cuBLAS `25.0us`, tiled prototype `1411.6us`
+  - row-major prototype:
+    - `q_proj`: cuBLAS `20.8us`, tiled prototype `390.6us`
+    - `o_proj`: cuBLAS `19.9us`, tiled prototype `593.9us`
+    - `down_proj`: cuBLAS `25.0us`, tiled prototype `1411.6us`
+  - Marlin-qweight prototype:
+    - scalar qvalue lookup version:
+      - `q_proj`: cuBLAS `20.6us`, Marlin-qweight prototype `460.0us`
+      - `o_proj`: cuBLAS `23.2us`, Marlin-qweight prototype `727.1us`
+      - `down_proj`: cuBLAS `25.2us`, Marlin-qweight prototype `1701.3us`
+    - compact packed-word decode version:
+      - `q_proj`: cuBLAS `20.3us`, fused `164.6us`
+      - `k_proj`: cuBLAS `16.9us`, fused `163.1us`
+      - `v_proj`: cuBLAS `16.8us`, fused `163.6us`
+      - `o_proj`: cuBLAS `20.5us`, fused `257.3us`
+      - `gate_proj`: cuBLAS `28.5us`, fused `165.3us`
+      - `up_proj`: cuBLAS `29.0us`, fused `166.4us`
+      - `down_proj`: cuBLAS `27.0us`, fused `593.9us`
+- Correctness on the compact packed-word decode path:
+  - `N_fp4=64, N_fp8=64, K=256`
+  - max abs error `0.030380`
+  - mean abs error `0.003356`
+  - relative error `0.2242%`
+- `cuobjdump --dump-resource-usage` on
+  [`rdquant/csrc/build/rdquant_cuda.so`](../rdquant/csrc/build/rdquant_cuda.so)
+  reports the fused Marlin-qweight kernel at:
+  - `REG=64`
+  - `SHARED=1280`
+  - `LOCAL=0`
+- A split-K transition kernel with in-kernel reduction is now implemented:
+  - `grid = (num_tiles, parallel_k)`
+  - partial sums accumulate into a reusable FP32 workspace
+  - one CTA per tile observes a completion counter and writes the final FP16
+    result plus resets the workspace for the next launch
+- With `parallel_k = K / 128`, this split-K prototype materially improves the
+  Marlin-qweight transition path:
+  - `q_proj`: cuBLAS `20.8us`, base `165.5us`, split-K `31.9us`
+  - `k_proj`: cuBLAS `17.0us`, base `163.5us`, split-K `22.9us`
+  - `v_proj`: cuBLAS `17.0us`, base `164.6us`, split-K `23.1us`
+  - `o_proj`: cuBLAS `20.9us`, base `257.7us`, split-K `37.1us`
+  - `gate_proj`: cuBLAS `28.9us`, base `166.1us`, split-K `49.7us`
+  - `up_proj`: cuBLAS `28.8us`, base `166.4us`, split-K `65.1us`
+  - `down_proj`: cuBLAS `26.6us`, base `592.9us`, split-K `70.6us`
+- A direct benchmark against the current `2x marlin_gemm + concat + inv_perm`
+  path shows the split-K prototype is already competitive:
+  - `q_proj`: `2x Marlin 65.6us`, split-K `31.3us`
+  - `k_proj`: `2x Marlin 58.8us`, split-K `22.5us`
+  - `v_proj`: `2x Marlin 62.9us`, split-K `22.7us`
+  - `o_proj`: `2x Marlin 66.4us`, split-K `35.6us`
+  - `gate_proj`: `2x Marlin 62.9us`, split-K `48.7us`
+  - `up_proj`: `2x Marlin 61.9us`, split-K `64.6us`
+  - `down_proj`: `2x Marlin 99.5us`, split-K `64.3us`
+- Breaking the current Marlin baseline into per-group kernel latencies makes the
+  remaining gap easier to interpret:
+  - `q_proj`: `Marlin NVFP4 23.7us`, `Marlin FP8 24.1us`, kernel sum `47.8us`,
+    end-to-end `2x Marlin 57.7us`
+  - `k_proj`: `Marlin NVFP4 31.9us`, `Marlin FP8 26.0us`, kernel sum `57.9us`,
+    end-to-end `2x Marlin 57.8us`
+  - `v_proj`: `Marlin NVFP4 25.4us`, `Marlin FP8 32.7us`, kernel sum `58.1us`,
+    end-to-end `2x Marlin 58.0us`
+  - `o_proj`: `Marlin NVFP4 23.4us`, `Marlin FP8 40.7us`, kernel sum `64.1us`,
+    end-to-end `2x Marlin 63.6us`
+  - `gate_proj`: `Marlin NVFP4 23.6us`, `Marlin FP8 24.2us`, kernel sum `47.7us`,
+    end-to-end `2x Marlin 57.8us`
+  - `up_proj`: `Marlin NVFP4 23.5us`, `Marlin FP8 25.6us`, kernel sum `49.2us`,
+    end-to-end `2x Marlin 56.9us`
+  - `down_proj`: `Marlin NVFP4 24.7us`, `Marlin FP8 74.3us`, kernel sum `99.0us`,
+    end-to-end `2x Marlin 97.0us`
+- This confirms the mixed fused path is mostly winning by eliminating a second
+  high-fixed-cost launch, with the largest benefit showing up when one group is
+  small enough to be a poor standalone Marlin decode kernel.
+- `cuobjdump --dump-resource-usage` for the split-K kernel reports:
+  - `REG=56`
+  - `SHARED=1284`
+  - `LOCAL=0`
+- The current `1 CTA = 1 output tile` scheduler is also fundamentally
+  under-parallelized on RTX 5090 (`170` SMs):
+  - `q_proj`: `32` tiles
+  - `k_proj`: `8` tiles
+  - `v_proj`: `8` tiles
+  - `o_proj`: `20` tiles
+  - `gate_proj`: `76` tiles
+  - `up_proj`: `76` tiles
+  - `down_proj`: `20` tiles
 
-Conclusion: the scheduler shape is now closer to the final design, but further
-work on this row-major prototype is not worthwhile. The next step has to be
-switching the loaders and inner loops to Marlin-repacked weights.
+Conclusion: recovering K-direction parallelism was necessary and already buys a
+large fraction of the gap back. But the remaining gap is still substantial for
+large shapes, so the next step has to be switching this split-K transition path
+from per-thread dot products to Marlin's actual vectorized shared-memory /
+tensorcore inner loop.
 
 ## Shared Config Choice For Mixed-Marlin v1
 
@@ -144,12 +232,13 @@ Difficulty: high
 
 ## Immediate Next Code Changes
 
-1. Replace the current row-major `run_fp4_tile` / `run_fp8_tile` loaders with
-   Marlin-packed tile loaders.
-2. Introduce a mixed tile descriptor or equivalent `slice_col` mapping so a
-   persistent kernel can walk `FP4` tiles first and `FP8` tiles second.
-3. Keep the current benchmark script, but switch its inputs to repacked test
-   tensors so the benchmark reflects the final memory layout.
+1. Keep the new split-K outer scheduler and replace its per-thread dot-product
+   loop with Marlin's tile engine for one shared decode config.
+2. Replace the plain-scale transition path with Marlin-permuted scale loads and
+   dtype-specific Marlin dequant/matmul loops.
+3. Once the tile engine is in place, revisit the split-K reduction path so its
+   workspace/lock semantics match Marlin more closely if that simplifies
+   integration.
 
 ## What Not To Do
 

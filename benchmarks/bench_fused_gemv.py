@@ -5,11 +5,24 @@ import sys
 import torch
 import torch.nn.functional as F
 import vllm._custom_ops as vllm_ops
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_make_workspace_new,
+    marlin_permute_scales,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+    nvfp4_marlin_process_global_scale,
+    nvfp4_marlin_process_scales,
+)
+from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+    fp8_fused_exponent_bias_into_scales,
+)
+from vllm.scalar_type import scalar_types
 
 sys.path.insert(0, "rdquant/csrc/build")
 import rdquant_cuda
 
 DEVICE = "cuda"
+K_TILE = 128
 
 # Qwen3-4B mixed layers: (name, N_total, K, N_fp4, N_fp8)
 QWEN3_4B_SHAPES = [
@@ -37,6 +50,11 @@ def bench(fn, warmup=200, repeat=1000):
         end.synchronize()
         total_ms += start.elapsed_time(end)
     return total_ms * 1000.0 / repeat
+
+
+def choose_parallel_k(n_tiles, k, target_ctas=None):
+    del n_tiles, target_ctas
+    return k // K_TILE
 
 
 def fp8_e4m3_encode(val_f32):
@@ -83,6 +101,7 @@ def fp8_e4m3_decode(raw):
 
 FP4_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+FP8_DECODE_LUT = torch.tensor([fp8_e4m3_decode(i) for i in range(256)], dtype=torch.float32)
 
 
 def get_weight_perm(num_bits):
@@ -118,6 +137,134 @@ def make_marlin_weight_map(num_bits, device=DEVICE):
     inv = torch.empty_like(perm)
     inv[perm] = torch.arange(perm.numel(), dtype=perm.dtype)
     return inv.to(device=device, dtype=torch.int32)
+
+
+def make_marlin_group_maps(device=DEVICE):
+    fp4_inv = make_marlin_weight_map(4, device="cpu")
+    fp8_inv = make_marlin_weight_map(8, device="cpu")
+
+    fp4_word_offsets = torch.empty((64, 4), dtype=torch.int32)
+    fp4_slot_map = torch.empty((64, 4, 4), dtype=torch.int32)
+    fp8_word_offsets = torch.empty((64, 4), dtype=torch.int32)
+
+    for n_in_tile in range(64):
+        for group in range(4):
+            sub = group * 2
+            base_idx = (n_in_tile // 16) * 256 + (n_in_tile % 16)
+
+            fp4_cols = [
+                fp4_inv[base_idx + (sub + 0) * 16].item(),
+                fp4_inv[base_idx + (sub + 1) * 16].item(),
+                fp4_inv[base_idx + (sub + 8) * 16].item(),
+                fp4_inv[base_idx + (sub + 9) * 16].item(),
+            ]
+            fp8_cols = [
+                fp8_inv[base_idx + (sub + 0) * 16].item(),
+                fp8_inv[base_idx + (sub + 1) * 16].item(),
+                fp8_inv[base_idx + (sub + 8) * 16].item(),
+                fp8_inv[base_idx + (sub + 9) * 16].item(),
+            ]
+
+            fp4_words = {col // 8 for col in fp4_cols}
+            fp8_words = {col // 4 for col in fp8_cols}
+            assert len(fp4_words) == 1
+            assert len(fp8_words) == 1
+
+            fp4_word_offsets[n_in_tile, group] = fp4_cols[0] // 8
+            fp8_word_offsets[n_in_tile, group] = fp8_cols[0] // 4
+            fp4_slot_map[n_in_tile, group, 0] = fp4_cols[0] % 8
+            fp4_slot_map[n_in_tile, group, 1] = fp4_cols[1] % 8
+            fp4_slot_map[n_in_tile, group, 2] = fp4_cols[2] % 8
+            fp4_slot_map[n_in_tile, group, 3] = fp4_cols[3] % 8
+
+    return (
+        fp4_word_offsets.to(device=device),
+        fp4_slot_map.to(device=device),
+        fp8_word_offsets.to(device=device),
+    )
+
+
+def decode_fp8_e4m3_tensor(raw):
+    lut = FP8_DECODE_LUT.to(device=raw.device)
+    return lut[raw.to(torch.long)]
+
+
+def prepare_marlin_nvfp4_scales(w_fp4_scales_raw, global_scale, k, n_fp4):
+    fp4_scales = decode_fp8_e4m3_tensor(w_fp4_scales_raw).T.contiguous().to(torch.float16)
+    fp4_scales = marlin_permute_scales(
+        fp4_scales, size_k=k, size_n=n_fp4, group_size=16
+    )
+    fp4_scales = nvfp4_marlin_process_scales(fp4_scales)
+    marlin_global_scale = nvfp4_marlin_process_global_scale(
+        torch.tensor(global_scale, device=w_fp4_scales_raw.device, dtype=torch.float16)
+    )
+    return fp4_scales, marlin_global_scale
+
+
+def prepare_marlin_fp8_scales(w_fp8_scales, k, n_fp8):
+    fp8_scales = w_fp8_scales.view(1, n_fp8).to(torch.float16)
+    fp8_scales = marlin_permute_scales(
+        fp8_scales, size_k=k, size_n=n_fp8, group_size=-1
+    )
+    return fp8_fused_exponent_bias_into_scales(fp8_scales)
+
+
+def run_marlin_nvfp4(x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale,
+                     marlin_ws4, n_fp4, k):
+    return vllm_ops.marlin_gemm(
+        a=x_fp16,
+        c=None,
+        b_q_weight=w_fp4_q,
+        b_bias=None,
+        b_scales=marlin_fp4_scales,
+        a_scales=None,
+        global_scale=marlin_global_scale,
+        b_zeros=None,
+        g_idx=None,
+        perm=None,
+        workspace=marlin_ws4,
+        b_q_type=scalar_types.float4_e2m1f,
+        size_m=1,
+        size_n=n_fp4,
+        size_k=k,
+    )
+
+
+def run_marlin_fp8(x_fp16, w_fp8_q, marlin_fp8_scales, marlin_ws8, n_fp8, k):
+    return vllm_ops.marlin_gemm(
+        a=x_fp16,
+        c=None,
+        b_q_weight=w_fp8_q,
+        b_bias=None,
+        b_scales=marlin_fp8_scales,
+        a_scales=None,
+        global_scale=None,
+        b_zeros=None,
+        g_idx=None,
+        perm=None,
+        workspace=marlin_ws8,
+        b_q_type=scalar_types.float8_e4m3fn,
+        size_m=1,
+        size_n=n_fp8,
+        size_k=k,
+    )
+
+
+def run_marlin_mixed(x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale,
+                     marlin_ws4, n_fp4, w_fp8_q, marlin_fp8_scales, marlin_ws8,
+                     n_fp8, k, inv_perm):
+    return torch.cat(
+        [
+            run_marlin_nvfp4(
+                x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale,
+                marlin_ws4, n_fp4, k
+            ),
+            run_marlin_fp8(
+                x_fp16, w_fp8_q, marlin_fp8_scales, marlin_ws8, n_fp8, k
+            ),
+        ],
+        dim=-1,
+    ).index_select(-1, inv_perm)
 
 
 def pack_fp4_to_marlin_qweight(w_fp4_packed):
@@ -213,17 +360,40 @@ def test_correctness():
     N_fp4, N_fp8, K = 64, 64, 256
     data = make_test_data(N_fp4, N_fp8, K)
     x = torch.randn(1, K, device=DEVICE, dtype=torch.float16)
-    fp4_map = make_marlin_weight_map(4)
-    fp8_map = make_marlin_weight_map(8)
+    fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps()
     w_fp4_q = pack_fp4_to_marlin_qweight(data["w_fp4"])
     w_fp8_q = pack_fp8_to_marlin_qweight(data["w_fp8"])
+    marlin_fp4_scales, marlin_global_scale = prepare_marlin_nvfp4_scales(
+        data["w_fp4_scales"], data["global_scale"], K, N_fp4
+    )
+    marlin_fp8_scales = prepare_marlin_fp8_scales(data["w_fp8_scales"], K, N_fp8)
+    marlin_ws4 = marlin_make_workspace_new(torch.device(DEVICE))
+    marlin_ws8 = marlin_make_workspace_new(torch.device(DEVICE))
+    num_tiles = (N_fp4 + 127) // 128 + (N_fp8 + 127) // 128
+    parallel_k = choose_parallel_k(num_tiles, K)
+    workspace = torch.zeros(N_fp4 + N_fp8, device=DEVICE, dtype=torch.float32)
+    tile_counters = torch.zeros(num_tiles, device=DEVICE, dtype=torch.int32)
 
     # Fused kernel result
     y_fused = rdquant_cuda.fused_mixed_gemv_marlin_weights(
         x,
         w_fp4_q, data["w_fp4_scales"], data["global_scale"],
-        w_fp8_q, data["w_fp8_scales"], fp4_map, fp8_map, data["inv_perm"],
+        w_fp8_q, data["w_fp8_scales"],
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+        data["inv_perm"],
         N_fp4, N_fp8, K
+    )
+    y_splitk = rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk(
+        x,
+        w_fp4_q, data["w_fp4_scales"], data["global_scale"],
+        w_fp8_q, data["w_fp8_scales"],
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+        data["inv_perm"], workspace, tile_counters,
+        N_fp4, N_fp8, K, parallel_k
+    )
+    y_marlin = run_marlin_mixed(
+        x, w_fp4_q, marlin_fp4_scales, marlin_global_scale, marlin_ws4, N_fp4,
+        w_fp8_q, marlin_fp8_scales, marlin_ws8, N_fp8, K, data["inv_perm"]
     )
 
     # Reference: dequant + matmul
@@ -232,14 +402,24 @@ def test_correctness():
 
     max_err = (y_fused.float() - y_ref.float()).abs().max().item()
     mean_err = (y_fused.float() - y_ref.float()).abs().mean().item()
+    splitk_max_err = (y_splitk.float() - y_ref.float()).abs().max().item()
+    splitk_mean_err = (y_splitk.float() - y_ref.float()).abs().mean().item()
+    marlin_max_err = (y_marlin.float() - y_ref.float()).abs().max().item()
+    marlin_mean_err = (y_marlin.float() - y_ref.float()).abs().mean().item()
     ref_norm = y_ref.float().abs().mean().item()
 
     print(f"  Shape: N_fp4={N_fp4}, N_fp8={N_fp8}, K={K}")
-    print(f"  Max absolute error:  {max_err:.6f}")
-    print(f"  Mean absolute error: {mean_err:.6f}")
+    print(f"  Base max absolute error:   {max_err:.6f}")
+    print(f"  Base mean absolute error:  {mean_err:.6f}")
+    print(f"  Split-K max absolute error:{splitk_max_err:.6f}")
+    print(f"  Split-K mean absolute error:{splitk_mean_err:.6f}")
+    print(f"  2xMarlin max abs error:    {marlin_max_err:.6f}")
+    print(f"  2xMarlin mean abs error:   {marlin_mean_err:.6f}")
     print(f"  Reference mean |y|:  {ref_norm:.6f}")
-    print(f"  Relative error:      {mean_err / (ref_norm + 1e-8):.4%}")
-    ok = max_err < 0.5  # FP4 has limited precision
+    print(f"  Base relative error: {mean_err / (ref_norm + 1e-8):.4%}")
+    print(f"  Split-K rel. error:  {splitk_mean_err / (ref_norm + 1e-8):.4%}")
+    print(f"  2xMarlin rel. error: {marlin_mean_err / (ref_norm + 1e-8):.4%}")
+    ok = max(max_err, splitk_max_err, marlin_max_err) < 0.5  # FP4 has limited precision
     print(f"  Status: {'PASS' if ok else 'FAIL'}")
     print()
     return ok
@@ -248,16 +428,21 @@ def test_correctness():
 def bench_shapes():
     """Benchmark fused GEMV vs cuBLAS BF16 for all Qwen3-4B shapes."""
     print("=" * 60)
-    print("Performance benchmark: Marlin-qweight fused GEMV vs cuBLAS BF16 GEMV")
+    print("Performance benchmark: 2x Marlin vs fused split-K vs cuBLAS BF16 GEMV")
     print("=" * 60)
     print(f"{'Layer':<14} {'N':>6} {'K':>6} {'N4':>5} {'N8':>5} "
-          f"{'cuBLAS':>8} {'Fused':>8} {'Speedup':>8}")
-    print("-" * 70)
+          f"{'cuBLAS':>8} {'Mrl4':>8} {'Mrl8':>8} {'M4+8':>8} {'2xMrl':>8} "
+          f"{'Base':>8} {'SplitK':>8} {'P_K':>5}")
+    print("-" * 128)
+
+    fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps()
 
     for name, N, K, N_fp4, N_fp8 in QWEN3_4B_SHAPES:
         N_total = N_fp4 + N_fp8
-        fp4_map = make_marlin_weight_map(4)
-        fp8_map = make_marlin_weight_map(8)
+        num_tiles = (N_fp4 + 127) // 128 + (N_fp8 + 127) // 128
+        parallel_k = choose_parallel_k(num_tiles, K)
+        workspace = torch.zeros(N_total, device=DEVICE, dtype=torch.float32)
+        tile_counters = torch.zeros(num_tiles, device=DEVICE, dtype=torch.int32)
 
         # --- cuBLAS BF16 baseline ---
         x_bf16 = torch.randn(1, K, device=DEVICE, dtype=torch.bfloat16)
@@ -273,16 +458,43 @@ def bench_shapes():
         inv_perm = torch.randperm(N_total, device=DEVICE, dtype=torch.int32)
         w_fp4_q = pack_fp4_to_marlin_qweight(w_fp4)
         w_fp8_q = pack_fp8_to_marlin_qweight(w_fp8)
+        marlin_fp4_scales, marlin_global_scale = prepare_marlin_nvfp4_scales(
+            w_fp4_scales, 1.0, K, N_fp4
+        )
+        marlin_fp8_scales = prepare_marlin_fp8_scales(w_fp8_scales, K, N_fp8)
+        marlin_ws4 = marlin_make_workspace_new(torch.device(DEVICE))
+        marlin_ws8 = marlin_make_workspace_new(torch.device(DEVICE))
 
+        t_marlin_fp4 = bench(lambda: run_marlin_nvfp4(
+            x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale,
+            marlin_ws4, N_fp4, K
+        ))
+        t_marlin_fp8 = bench(lambda: run_marlin_fp8(
+            x_fp16, w_fp8_q, marlin_fp8_scales, marlin_ws8, N_fp8, K
+        ))
+        t_marlin_sum = t_marlin_fp4 + t_marlin_fp8
+        t_marlin = bench(lambda: run_marlin_mixed(
+            x_fp16, w_fp4_q, marlin_fp4_scales, marlin_global_scale, marlin_ws4,
+            N_fp4, w_fp8_q, marlin_fp8_scales, marlin_ws8, N_fp8, K, inv_perm
+        ))
         t_fused = bench(lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights(
             x_fp16, w_fp4_q, w_fp4_scales, 1.0,
-            w_fp8_q, w_fp8_scales, fp4_map, fp8_map, inv_perm,
+            w_fp8_q, w_fp8_scales,
+            fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+            inv_perm,
             N_fp4, N_fp8, K
         ))
-
-        speedup = t_cublas / t_fused if t_fused > 0 else float('inf')
+        t_splitk = bench(lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk(
+            x_fp16, w_fp4_q, w_fp4_scales, 1.0,
+            w_fp8_q, w_fp8_scales,
+            fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+            inv_perm, workspace, tile_counters,
+            N_fp4, N_fp8, K, parallel_k
+        ))
         print(f"{name:<14} {N:>6} {K:>6} {N_fp4:>5} {N_fp8:>5} "
-              f"{t_cublas:>7.1f}us {t_fused:>7.1f}us {speedup:>7.2f}x")
+              f"{t_cublas:>7.1f}us {t_marlin_fp4:>7.1f}us {t_marlin_fp8:>7.1f}us "
+              f"{t_marlin_sum:>7.1f}us {t_marlin:>7.1f}us {t_fused:>7.1f}us "
+              f"{t_splitk:>7.1f}us {parallel_k:>5}")
 
     print()
 
