@@ -643,7 +643,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
     int k,
     int parallel_k) {
   __shared__ half x_tile[kBlockK];
-  __shared__ int32_t sh_fp8_q_tile[kFp8MaxWordsPerKTile];
+  __shared__ int32_t sh_fp8_q_tile[2][kFp8MaxWordsPerKTile];
   __shared__ int last_slice_flag;
 
   TileDesc tile = resolve_tile(blockIdx.x, n_fp4, n_fp8);
@@ -669,34 +669,48 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
   int n_tile = lane_channel / 64;
   int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
+  const bool is_fp8_tile = tile.kind == kTileFP8;
   const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
   const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
   const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
 
-  for (int k0 = k_begin; k0 < k_end; k0 += kBlockK) {
+  if (is_fp8_tile) {
+    stage_fp8_qweight_k_tile(
+        w_fp8_q, sh_fp8_q_tile[0], tile.tile_base, tile.valid_channels,
+        fp8_row_stride, k_begin);
+    cp_async_fence();
+    cp_async_wait<0>();
+    __syncthreads();
+  }
+
+  for (int k0 = k_begin, pipe = 0; k0 < k_end; k0 += kBlockK, pipe ^= 1) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
-    if (tile.kind == kTileFP8) {
-      stage_fp8_qweight_k_tile(
-          w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
-          fp8_row_stride, k0);
-      cp_async_fence();
-      cp_async_wait<0>();
-    }
     __syncthreads();
 
+    const int next_k0 = k0 + kBlockK;
+    if (is_fp8_tile && next_k0 < k_end) {
+      stage_fp8_qweight_k_tile(
+          w_fp8_q, sh_fp8_q_tile[pipe ^ 1], tile.tile_base, tile.valid_channels,
+          fp8_row_stride, next_k0);
+      cp_async_fence();
+    }
+
     if (active) {
-      if (tile.kind == kTileNVFP4) {
+      if (!is_fp8_tile) {
         acc += run_nvfp4_qweight_k_tile_scalar(
             w_fp4_q, w_fp4_scales, w_fp4_global_scale,
             fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
             fp4_row_stride, k, k0);
       } else {
         acc += run_fp8_qweight_k_tile(
-            sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            sh_fp8_q_tile[pipe], w_fp8_scales, fp8_word_row, x_tile, lane_channel,
             local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
       }
     }
 
+    if (is_fp8_tile && next_k0 < k_end) {
+      cp_async_wait<0>();
+    }
     __syncthreads();
   }
 

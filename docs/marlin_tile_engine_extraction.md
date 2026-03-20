@@ -112,6 +112,9 @@ Current progress on this sequence:
   - `cp.async`-backed qweight global->shared copies
   - a double-buffered shared->register helper pipeline across the eight
     `16-K` subtiles inside one `kBlockK=128` slice
+  - on the main split-K kernel, a real cross-`kBlockK` FP8 qweight prefetch
+    path that stages the next `kBlockK` tile into an alternate shared buffer
+    while the current tile is being computed
 - The result is structurally closer to Marlin, but still missing:
   - cp.async-based global->shared staging
   - software pipelining across stages
@@ -133,11 +136,12 @@ Current progress on this sequence:
   same `cp.async` family of primitives instead of plain vector stores.
 - What is still missing relative to Marlin:
   - multi-stage double buffering
-  - overlapping fetch of the next tile with compute on the current tile
   - cp.async-based activation/scales staging
-  The new FP8 register pipeline is still only an inner-helper pipeline; it does
-  not yet overlap the global->shared fetch of the next `kBlockK` tile with the
-  compute on the current one.
+  The main split-K FP8 path now does overlap the fetch of the next `kBlockK`
+  qweight tile with compute on the current one, but it still does not have
+  Marlin's deeper multi-stage pipeline or cp.async-based activation/scales
+  staging. The current overlap also comes with a larger shared footprint, so it
+  is not yet a uniform performance win.
 
 ## Why FP8 First
 

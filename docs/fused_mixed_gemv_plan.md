@@ -218,19 +218,22 @@ Observed result on RTX 5090:
   refilling the slot for the subtile two steps ahead. This is a structural move
   toward Marlin's register pipeline even though the current end-to-end latency
   impact is still mixed.
-- `cuobjdump --dump-resource-usage` after this change still reports
-  `REG=56` for both split-K kernels, so the new FP8 register pipeline did not
-  increase register count at the kernel level. The remaining bottleneck is
-  therefore more likely to be shared-memory behavior / issue overlap than a
-  simple occupancy collapse from register pressure.
+- The main split-K kernel now also overlaps FP8 qweight global->shared fetches
+  across adjacent `kBlockK` tiles. It primes the first FP8 qweight tile before
+  entering the loop, then issues `cp.async` for the next tile into an alternate
+  shared buffer while computing on the current one.
+- After adding the cross-`kBlockK` FP8 overlap to the main split-K kernel,
+  `cuobjdump` reports that kernel at `REG=64`, `SHARED=34052`, up from the
+  earlier `REG=56`, `SHARED=17668`. This explains why the overlap is not a free
+  win: the intended latency hiding comes with a materially larger shared-memory
+  footprint and a small register bump.
 - A smoke benchmark after extracting those dtype-specific tile entry points
   still passes correctness and preserves the same qualitative ranking:
   split-K remains far ahead of the base fused kernel, so this refactor is a
   clean structural step toward swapping in a Marlin tile engine.
-- `cuobjdump --dump-resource-usage` for the split-K kernel reports:
-  - `REG=56`
-  - `SHARED=1284`
-  - `LOCAL=0`
+- `cuobjdump --dump-resource-usage` for the current split-K kernels reports:
+  - scalar-NVFP4 split-K kernel: `REG=64`, `SHARED=34052`, `LOCAL=0`
+  - staged-NVFP4 split-K kernel: `REG=56`, `SHARED=18692`, `LOCAL=0`
 - The current `1 CTA = 1 output tile` scheduler is also fundamentally
   under-parallelized on RTX 5090 (`170` SMs):
   - `q_proj`: `32` tiles
