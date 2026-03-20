@@ -307,19 +307,21 @@ __device__ __forceinline__ void stage_fp8_qweight_k_tile(
     const int32_t* __restrict__ w_fp8_q,
     int32_t* __restrict__ sh_fp8_q_tile,
     int tile_base,
-    int valid_channels,
-    int fp8_row_stride,
-    int k0) {
+  int valid_channels,
+  int fp8_row_stride,
+  int k0) {
   const int words_per_k_chunk = fp8_words_per_k_chunk(valid_channels);
-  const int total_words = kQweightTileKChunks * words_per_k_chunk;
   const int tile_word_base = (tile_base / 64) * kFp8WordsPerSubtile;
+  const int vecs_per_k_chunk = words_per_k_chunk / 4;
 
-  for (int word_idx = threadIdx.x; word_idx < total_words; word_idx += blockDim.x) {
-    const int kk_block = word_idx / words_per_k_chunk;
-    const int local_word = word_idx % words_per_k_chunk;
+  for (int vec_idx = threadIdx.x; vec_idx < kQweightTileKChunks * vecs_per_k_chunk;
+       vec_idx += blockDim.x) {
+    const int kk_block = vec_idx / vecs_per_k_chunk;
+    const int local_vec = vec_idx % vecs_per_k_chunk;
     const int global_row_base =
         ((k0 / 16) + kk_block) * fp8_row_stride + tile_word_base;
-    sh_fp8_q_tile[word_idx] = w_fp8_q[global_row_base + local_word];
+    reinterpret_cast<int4*>(sh_fp8_q_tile + kk_block * words_per_k_chunk)[local_vec] =
+        reinterpret_cast<const int4*>(w_fp8_q + global_row_base)[local_vec];
   }
 }
 
@@ -327,19 +329,21 @@ __device__ __forceinline__ void stage_fp4_qweight_k_tile(
     const int32_t* __restrict__ w_fp4_q,
     int32_t* __restrict__ sh_fp4_q_tile,
     int tile_base,
-    int valid_channels,
-    int fp4_row_stride,
-    int k0) {
+  int valid_channels,
+  int fp4_row_stride,
+  int k0) {
   const int words_per_k_chunk = fp4_words_per_k_chunk(valid_channels);
-  const int total_words = kQweightTileKChunks * words_per_k_chunk;
   const int tile_word_base = (tile_base / 64) * kFp4WordsPerSubtile;
+  const int vecs_per_k_chunk = words_per_k_chunk / 4;
 
-  for (int word_idx = threadIdx.x; word_idx < total_words; word_idx += blockDim.x) {
-    const int kk_block = word_idx / words_per_k_chunk;
-    const int local_word = word_idx % words_per_k_chunk;
+  for (int vec_idx = threadIdx.x; vec_idx < kQweightTileKChunks * vecs_per_k_chunk;
+       vec_idx += blockDim.x) {
+    const int kk_block = vec_idx / vecs_per_k_chunk;
+    const int local_vec = vec_idx % vecs_per_k_chunk;
     const int global_row_base =
         ((k0 / 16) + kk_block) * fp4_row_stride + tile_word_base;
-    sh_fp4_q_tile[word_idx] = w_fp4_q[global_row_base + local_word];
+    reinterpret_cast<int4*>(sh_fp4_q_tile + kk_block * words_per_k_chunk)[local_vec] =
+        reinterpret_cast<const int4*>(w_fp4_q + global_row_base)[local_vec];
   }
 }
 

@@ -74,6 +74,10 @@ Implemented:
   did not show a stable end-to-end win on the current split-K benchmark. This
   keeps the best mixed path conservative while still letting the base kernel
   evolve toward the same staged tile structure.
+- The staged qweight loaders now use 16-byte vector copies into shared memory
+  instead of scalar `int32` copies. This is still short of Marlin's async
+  pipeline, but it narrows the gap between the current prototype and Marlin's
+  wide staged global->shared transfer pattern.
 
 Observed result on RTX 5090:
 
