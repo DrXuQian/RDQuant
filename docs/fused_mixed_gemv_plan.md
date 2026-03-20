@@ -218,22 +218,34 @@ Observed result on RTX 5090:
   refilling the slot for the subtile two steps ahead. This is a structural move
   toward Marlin's register pipeline even though the current end-to-end latency
   impact is still mixed.
-- The main split-K kernel now also overlaps FP8 qweight global->shared fetches
-  across adjacent `kBlockK` tiles. It primes the first FP8 qweight tile before
-  entering the loop, then issues `cp.async` for the next tile into an alternate
-  shared buffer while computing on the current one.
-- After adding the cross-`kBlockK` FP8 overlap to the main split-K kernel,
-  `cuobjdump` reports that kernel at `REG=64`, `SHARED=34052`, up from the
-  earlier `REG=56`, `SHARED=17668`. This explains why the overlap is not a free
-  win: the intended latency hiding comes with a materially larger shared-memory
-  footprint and a small register bump.
+- The main split-K FP8 path now uses a lighter overlap scheme at `16-K` chunk
+  granularity instead of double-buffering an entire `kBlockK=128` qweight tile.
+  Concretely, each loop iteration stages one `16-K` FP8 chunk into shared,
+  prefetches only the next `16-K` chunk with `cp.async`, and alternates between
+  two small chunk buffers while the current chunk is being computed.
+- That lighter chunk overlap keeps the FP8 fetch/compute overlap structure
+  without paying the cost of duplicating the full FP8 shared tile. After this
+  change, `cuobjdump` reports:
+  - scalar-NVFP4 split-K kernel: `REG=56`, `SHARED=5380`, `LOCAL=0`
+  - staged-NVFP4 split-K kernel: `REG=64`, `SHARED=10500`, `LOCAL=0`
+  This is materially smaller than the earlier whole-`kBlockK` overlap version,
+  which had pushed the main split-K kernel up to `REG=64`, `SHARED=34052`.
 - A smoke benchmark after extracting those dtype-specific tile entry points
   still passes correctness and preserves the same qualitative ranking:
   split-K remains far ahead of the base fused kernel, so this refactor is a
   clean structural step toward swapping in a Marlin tile engine.
-- `cuobjdump --dump-resource-usage` for the current split-K kernels reports:
-  - scalar-NVFP4 split-K kernel: `REG=64`, `SHARED=34052`, `LOCAL=0`
-  - staged-NVFP4 split-K kernel: `REG=56`, `SHARED=18692`, `LOCAL=0`
+- A smoke benchmark on the lighter FP8 chunk-overlap version still passes
+  correctness and keeps the split-K path near the current best range:
+  - `q_proj`: `SplitK 30.9us`, `Split4S 31.1us`, `AutoSK 30.7us`
+  - `k_proj`: `SplitK 20.4us`, `Split4S 20.4us`, `AutoSK 20.4us`
+  - `v_proj`: `SplitK 20.4us`, `Split4S 20.3us`, `AutoSK 20.4us`
+  - `o_proj`: `SplitK 36.5us`, `Split4S 36.8us`, `AutoSK 36.4us`
+  - `gate_proj`: `SplitK 47.1us`, `Split4S 52.8us`, `AutoSK 47.2us`
+  - `up_proj`: `SplitK 63.8us`, `Split4S 64.5us`, `AutoSK 63.7us`
+  - `down_proj`: `SplitK 70.6us`, `Split4S 64.5us`, `AutoSK 63.2us`
+- This means the lighter chunk overlap preserves most of the useful FP8 overlap
+  structure while removing the pathological shared-memory blow-up from the
+  earlier whole-`kBlockK` ping-pong design.
 - The current `1 CTA = 1 output tile` scheduler is also fundamentally
   under-parallelized on RTX 5090 (`170` SMs):
   - `q_proj`: `32` tiles

@@ -112,11 +112,10 @@ Current progress on this sequence:
   - `cp.async`-backed qweight global->shared copies
   - a double-buffered shared->register helper pipeline across the eight
     `16-K` subtiles inside one `kBlockK=128` slice
-  - on the main split-K kernel, a real cross-`kBlockK` FP8 qweight prefetch
-    path that stages the next `kBlockK` tile into an alternate shared buffer
-    while the current tile is being computed
+  - on the main split-K kernel, a lighter cross-`kBlockK` FP8 prefetch path
+    that only ping-pongs two `16-K` shared chunks instead of duplicating the
+    full `kBlockK` qweight tile
 - The result is structurally closer to Marlin, but still missing:
-  - cp.async-based global->shared staging
   - software pipelining across stages
   - Marlin's fragment/register blocking
 - `NVFP4` now also has a staged-qweight/staged-scale version in the base fused
@@ -137,11 +136,14 @@ Current progress on this sequence:
 - What is still missing relative to Marlin:
   - multi-stage double buffering
   - cp.async-based activation/scales staging
-  The main split-K FP8 path now does overlap the fetch of the next `kBlockK`
-  qweight tile with compute on the current one, but it still does not have
-  Marlin's deeper multi-stage pipeline or cp.async-based activation/scales
-  staging. The current overlap also comes with a larger shared footprint, so it
-  is not yet a uniform performance win.
+  The main split-K FP8 path now does overlap qweight fetch with compute, but it
+  does so with a lighter `16-K` chunk ping-pong instead of a full-tile
+  double-buffer. That keeps the overlap structure while pulling resource usage
+  back down to a more practical range:
+  - scalar-NVFP4 split-K kernel: `REG=56`, `SHARED=5380`
+  - staged-NVFP4 split-K kernel: `REG=64`, `SHARED=10500`
+  It still does not have Marlin's deeper multi-stage pipeline or cp.async-based
+  activation/scales staging, so there is still headroom in the inner loop.
 
 ## Why FP8 First
 
