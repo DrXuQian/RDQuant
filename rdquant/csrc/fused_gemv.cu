@@ -410,13 +410,11 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
 
 __device__ __forceinline__ float run_fp8_qweight_16_chunk_half2(
     const int32_t* __restrict__ sh_fp8_q_chunk,
-    const float* __restrict__ w_fp8_scales,
+    half2 scale_h2,
     const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
-    int channel,
     int local_n_tile,
     int kk) {
-  const half2 scale_h2 = __float2half2_rn(w_fp8_scales[channel]);
   const int row_base = local_n_tile * kFp8WordsPerSubtile;
   float acc = 0.0f;
 
@@ -442,10 +440,9 @@ __device__ __forceinline__ float run_fp8_qweight_16_chunk_half2(
 
 __device__ __forceinline__ float run_fp8_qweight_chunk_half2(
     const int32_t* __restrict__ sh_fp8_q_chunk,
-    const float* __restrict__ w_fp8_scales,
+    half2 scale_h2,
     const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
-    int channel,
     int local_n_tile,
     int words_per_k_chunk,
     int kk_base) {
@@ -454,8 +451,8 @@ __device__ __forceinline__ float run_fp8_qweight_chunk_half2(
   #pragma unroll
   for (int subtile = 0; subtile < kFp8ChunkSubtiles; ++subtile) {
     acc += run_fp8_qweight_16_chunk_half2(
-        sh_fp8_q_chunk + subtile * words_per_k_chunk, w_fp8_scales,
-        fp8_word_row, x_tile, channel, local_n_tile,
+        sh_fp8_q_chunk + subtile * words_per_k_chunk, scale_h2,
+        fp8_word_row, x_tile, local_n_tile,
         kk_base + subtile * 16);
   }
 
@@ -791,6 +788,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
   const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
   const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
   const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+  const half2 fp8_scale_h2 =
+      (active && is_fp8_tile) ? __float2half2_rn(w_fp8_scales[lane_channel])
+                              : __float2half2_rn(0.0f);
 
   for (int k0 = k_begin; k0 < k_end; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
@@ -825,8 +825,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
 
         if (active) {
           acc += run_fp8_qweight_16_chunk_half2(
-              sh_fp8_q_chunk[pipe], w_fp8_scales, fp8_word_row, x_tile,
-              lane_channel, local_n_tile, kk_block * 16);
+              sh_fp8_q_chunk[pipe], fp8_scale_h2, fp8_word_row, x_tile,
+              local_n_tile, kk_block * 16);
         }
 
         if (next_kk_block < kQweightTileKChunks) {
@@ -915,6 +915,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel(
   const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
   const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
   const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+  const half2 fp8_scale_h2 =
+      (active && is_fp8_tile) ? __float2half2_rn(w_fp8_scales[lane_channel])
+                              : __float2half2_rn(0.0f);
 
   for (int k0 = k_begin; k0 < k_end; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
@@ -950,8 +953,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel(
 
         if (active) {
           acc += run_fp8_qweight_chunk_half2(
-              sh_fp8_q_chunk[pipe], w_fp8_scales, fp8_word_row, x_tile,
-              lane_channel, local_n_tile, words_per_k_chunk, kk_block * 16);
+              sh_fp8_q_chunk[pipe], fp8_scale_h2, fp8_word_row, x_tile,
+              local_n_tile, words_per_k_chunk, kk_block * 16);
         }
 
         if (next_kk_block < kQweightTileKChunks) {
@@ -1044,6 +1047,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
   const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
   const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
   const bool is_fp8_tile = tile.kind == kTileFP8;
+  const half2 fp8_scale_h2 =
+      (active && is_fp8_tile) ? __float2half2_rn(w_fp8_scales[lane_channel])
+                              : __float2half2_rn(0.0f);
 
   for (int k0 = k_begin; k0 < k_end; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
@@ -1088,8 +1094,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
 
         if (active) {
           acc += run_fp8_qweight_chunk_half2(
-              sh_q_tile.fp8_q_chunk[pipe], w_fp8_scales, fp8_word_row, x_tile,
-              lane_channel, local_n_tile, words_per_k_chunk, kk_block * 16);
+              sh_q_tile.fp8_q_chunk[pipe], fp8_scale_h2, fp8_word_row, x_tile,
+              local_n_tile, words_per_k_chunk, kk_block * 16);
         }
 
         if (next_kk_block < kQweightTileKChunks) {

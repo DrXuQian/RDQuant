@@ -149,6 +149,14 @@ Current progress on this sequence:
   - `q_proj` scalar `SplitK` sits around compute `57.7%` / DRAM `31.0%`
   - `down_proj` scalar `SplitK` sits around compute `90.3%` / DRAM `18.4%`
   That is exactly why a single global FP8 chunk size is not ideal.
+- Those same `ncu` runs now also point at the next inner-loop target more
+  specifically:
+  - `q_proj` narrow FP8 path shows long-scoreboard `5.65` and MIO throttle
+    `5.02`
+  - `down_proj` wide FP8 path shows long-scoreboard `3.70` but much larger MIO
+    throttle `14.44`
+  So the next profitable FP8 work is reducing repeated helper-side loads and
+  conversions, not adding even deeper qweight buffering by default.
 - RDQuant therefore now keeps two scalar-NVFP4 split-K FP8 chunk variants:
   - a narrow `16-K` chunk kernel (`SHARED=5380`)
   - a wider `32-K` chunk kernel (`SHARED=9476`)
@@ -156,6 +164,11 @@ Current progress on this sequence:
   shapes (`N_fp8 <= 128`, `K >= 4096`), which matches the current `o_proj` /
   `down_proj` corner without paying that shared-memory cost on the rest of the
   decode layers.
+- The latest cleanup step hoists FP8 per-channel scale conversion out of the
+  split-K chunk helpers. The helper now consumes a precomputed `half2` scale
+  instead of reloading/converting it inside every `16-K` or `32-K` chunk. This
+  keeps the main split-K kernels at `REG=56` while slightly improving the
+  current best-of-two fused latency.
 
 ## Why FP8 First
 

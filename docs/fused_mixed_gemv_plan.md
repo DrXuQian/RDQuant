@@ -218,6 +218,24 @@ Observed result on RTX 5090:
   refilling the slot for the subtile two steps ahead. This is a structural move
   toward Marlin's register pipeline even though the current end-to-end latency
   impact is still mixed.
+- Remote `ncu` runs on RTX 5070 now show the current scalar-NVFP4 split-K path
+  is primarily limited by scheduler eligibility and MIO/scoreboard pressure,
+  not raw DRAM bandwidth:
+  - `q_proj` narrow FP8 split-K: duration `40.2us`, DRAM `33.1%`, SM `58.9%`,
+    long scoreboard `5.65`, MIO throttle `5.02`
+  - `down_proj` wide FP8 split-K: duration `120.7us`, DRAM `18.3%`, SM `90.0%`,
+    long scoreboard `3.70`, MIO throttle `14.44`
+  This makes hot-path cleanup in the FP8 helper a better next target than
+  further increasing qweight staging depth.
+- The latest landed FP8 cleanup hoists the per-channel FP8 scale conversion out
+  of the split-K `16-K` / `32-K` chunk helpers and computes the `half2` scale
+  once per thread at kernel entry. This is a small change, but it is stable and
+  resource-neutral on RTX 5090:
+  - scalar split-K kernel remains `REG=56`, `SHARED=5380`
+  - wide-FP8 split-K kernel remains `REG=56`, `SHARED=9476`
+  - staged-NVFP4 split-K kernel remains `REG=56`, `SHARED=10500`
+  and it nudges the current per-layer best-of-two split-K total down slightly
+  from roughly `285.1us` to `284.7us` across the 7 target layers.
 - The main split-K FP8 path now uses a lighter overlap scheme at `16-K` chunk
   granularity instead of double-buffering an entire `kBlockK=128` qweight tile.
   Concretely, each loop iteration stages one `16-K` FP8 chunk into shared,
