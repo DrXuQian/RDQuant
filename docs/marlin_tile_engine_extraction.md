@@ -112,6 +112,9 @@ Current progress on this sequence:
   - cp.async-based global->shared staging
   - software pipelining across stages
   - Marlin's fragment/register blocking
+- `NVFP4` now also has a staged-qweight/staged-scale version in the base fused
+  kernel. The split-K kernel still uses the scalar/global NVFP4 helper because
+  that remains the safer choice for the current best-latency path.
 
 ## Why FP8 First
 

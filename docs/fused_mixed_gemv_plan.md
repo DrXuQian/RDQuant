@@ -68,6 +68,12 @@ Implemented:
   current split-K end-to-end latency is still roughly flat. The main value of
   this step is establishing the shared `B` staging seam that a later cp.async /
   software-pipelined FP8 helper can build on.
+- The NVFP4 path now has the analogous staged-qweight/staged-scale structure in
+  the base fused kernel. For the split-K kernel, the active NVFP4 path is still
+  the older scalar/global-load version for now, because the staged NVFP4 path
+  did not show a stable end-to-end win on the current split-K benchmark. This
+  keeps the best mixed path conservative while still letting the base kernel
+  evolve toward the same staged tile structure.
 
 Observed result on RTX 5090:
 

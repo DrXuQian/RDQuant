@@ -26,8 +26,11 @@ constexpr int kBlockN = 128;
 constexpr int kBlockK = 128;
 constexpr int kThreadsPerBlock = kBlockN;
 constexpr int kQweightTileKChunks = kBlockK / 16;
+constexpr int kFp4WordsPerSubtile = 128;
 constexpr int kFp8WordsPerSubtile = 256;
+constexpr int kFp4MaxWordsPerKTile = kQweightTileKChunks * 2 * kFp4WordsPerSubtile;
 constexpr int kFp8MaxWordsPerKTile = kQweightTileKChunks * 2 * kFp8WordsPerSubtile;
+constexpr int kFp4MaxScalesPerKTile = kBlockN * kQweightTileKChunks;
 
 enum TileKind : int {
   kTileNVFP4 = 0,
@@ -63,6 +66,10 @@ __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t raw) {
 
 __device__ __forceinline__ int fp8_words_per_k_chunk(int valid_channels) {
   return ((valid_channels + 63) / 64) * kFp8WordsPerSubtile;
+}
+
+__device__ __forceinline__ int fp4_words_per_k_chunk(int valid_channels) {
+  return ((valid_channels + 63) / 64) * kFp4WordsPerSubtile;
 }
 
 __device__ __forceinline__ void dequant_fp8_word_to_half2_pairs(
@@ -217,6 +224,45 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
   return acc;
 }
 
+__device__ __forceinline__ float run_nvfp4_qweight_k_tile_staged(
+    const int32_t* __restrict__ sh_fp4_q_tile,
+    const uint8_t* __restrict__ sh_fp4_scales,
+    float w_fp4_global_scale,
+    const int32_t* __restrict__ fp4_word_row,
+    const int32_t* __restrict__ fp4_slot_row,
+    const half* __restrict__ x_tile,
+    int local_channel,
+    int local_n_tile,
+    int words_per_k_chunk) {
+  float acc = 0.0f;
+
+  #pragma unroll
+  for (int kk = 0; kk < kBlockK; kk += 16) {
+    const int row_base = (kk / 16) * words_per_k_chunk +
+                         local_n_tile * kFp4WordsPerSubtile;
+    const float scale = fp8_e4m3_to_float(
+        sh_fp4_scales[local_channel * kQweightTileKChunks + (kk / 16)]) *
+        w_fp4_global_scale;
+    #pragma unroll
+    for (int group = 0; group < 4; ++group) {
+      const int packed = sh_fp4_q_tile[row_base + fp4_word_row[group]];
+      const int32_t* slot_group = fp4_slot_row + group * 4;
+
+      const int sub = group * 2;
+      acc += c_fp4_lut[(packed >> (4 * slot_group[0])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub]);
+      acc += c_fp4_lut[(packed >> (4 * slot_group[1])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub + 1]);
+      acc += c_fp4_lut[(packed >> (4 * slot_group[2])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub + 8]);
+      acc += c_fp4_lut[(packed >> (4 * slot_group[3])) & 0xF] *
+             scale * __half2float(x_tile[kk + sub + 9]);
+    }
+  }
+
+  return acc;
+}
+
 __device__ __forceinline__ float sum_half2(half2 x) {
   return __half2float(__low2half(x)) + __half2float(__high2half(x));
 }
@@ -277,24 +323,61 @@ __device__ __forceinline__ void stage_fp8_qweight_k_tile(
   }
 }
 
+__device__ __forceinline__ void stage_fp4_qweight_k_tile(
+    const int32_t* __restrict__ w_fp4_q,
+    int32_t* __restrict__ sh_fp4_q_tile,
+    int tile_base,
+    int valid_channels,
+    int fp4_row_stride,
+    int k0) {
+  const int words_per_k_chunk = fp4_words_per_k_chunk(valid_channels);
+  const int total_words = kQweightTileKChunks * words_per_k_chunk;
+  const int tile_word_base = (tile_base / 64) * kFp4WordsPerSubtile;
+
+  for (int word_idx = threadIdx.x; word_idx < total_words; word_idx += blockDim.x) {
+    const int kk_block = word_idx / words_per_k_chunk;
+    const int local_word = word_idx % words_per_k_chunk;
+    const int global_row_base =
+        ((k0 / 16) + kk_block) * fp4_row_stride + tile_word_base;
+    sh_fp4_q_tile[word_idx] = w_fp4_q[global_row_base + local_word];
+  }
+}
+
+__device__ __forceinline__ void stage_fp4_scales_k_tile(
+    const uint8_t* __restrict__ w_fp4_scales,
+    uint8_t* __restrict__ sh_fp4_scales,
+    int tile_base,
+    int valid_channels,
+    int k,
+    int k0) {
+  const int scales_per_channel = k / 16;
+  const int total_scales = valid_channels * kQweightTileKChunks;
+
+  for (int scale_idx = threadIdx.x; scale_idx < total_scales; scale_idx += blockDim.x) {
+    const int local_channel = scale_idx / kQweightTileKChunks;
+    const int kk_block = scale_idx % kQweightTileKChunks;
+    sh_fp4_scales[scale_idx] =
+        w_fp4_scales[(tile_base + local_channel) * scales_per_channel +
+                     (k0 / 16) + kk_block];
+  }
+}
+
 // Keep a stable entry point for each dtype path so the mixed scheduler does not
 // need to change again when the scalar path is replaced with a Marlin-style
 // tile engine.
 __device__ __forceinline__ float run_nvfp4_qweight_k_tile(
-    const int32_t* __restrict__ w_fp4_q,
-    const uint8_t* __restrict__ w_fp4_scales,
+    const int32_t* __restrict__ sh_fp4_q_tile,
+    const uint8_t* __restrict__ sh_fp4_scales,
     float w_fp4_global_scale,
     const int32_t* __restrict__ fp4_word_row,
     const int32_t* __restrict__ fp4_slot_row,
     const half* __restrict__ x_tile,
-    int channel,
-    int n_tile,
-    int fp4_row_stride,
-    int k,
-    int k0) {
-  return run_nvfp4_qweight_k_tile_scalar(
-      w_fp4_q, w_fp4_scales, w_fp4_global_scale, fp4_word_row, fp4_slot_row,
-      x_tile, channel, n_tile, fp4_row_stride, k, k0);
+    int local_channel,
+    int local_n_tile,
+    int words_per_k_chunk) {
+  return run_nvfp4_qweight_k_tile_staged(
+      sh_fp4_q_tile, sh_fp4_scales, w_fp4_global_scale, fp4_word_row,
+      fp4_slot_row, x_tile, local_channel, local_n_tile, words_per_k_chunk);
 }
 
 __device__ __forceinline__ float run_fp8_qweight_k_tile(
@@ -372,6 +455,8 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
     int n_fp8,
     int k) {
   __shared__ half x_tile[kBlockK];
+  __shared__ int32_t sh_fp4_q_tile[kFp4MaxWordsPerKTile];
+  __shared__ uint8_t sh_fp4_scales[kFp4MaxScalesPerKTile];
   __shared__ int32_t sh_fp8_q_tile[kFp8MaxWordsPerKTile];
 
   TileDesc tile = resolve_tile(blockIdx.x, n_fp4, n_fp8);
@@ -384,7 +469,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
   float acc = 0.0f;
   int fp4_row_stride = n_fp4 * 2;
   int fp8_row_stride = n_fp8 * 4;
-  int n_tile = lane_channel / 64;
+  int local_channel = threadIdx.x;
   int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
   const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
@@ -393,7 +478,13 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
 
   for (int k0 = 0; k0 < k; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
-    if (tile.kind == kTileFP8) {
+    if (tile.kind == kTileNVFP4) {
+      stage_fp4_qweight_k_tile(
+          w_fp4_q, sh_fp4_q_tile, tile.tile_base, tile.valid_channels,
+          fp4_row_stride, k0);
+      stage_fp4_scales_k_tile(
+          w_fp4_scales, sh_fp4_scales, tile.tile_base, tile.valid_channels, k, k0);
+    } else {
       stage_fp8_qweight_k_tile(
           w_fp8_q, sh_fp8_q_tile, tile.tile_base, tile.valid_channels,
           fp8_row_stride, k0);
@@ -403,9 +494,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
     if (active) {
       if (tile.kind == kTileNVFP4) {
         acc += run_nvfp4_qweight_k_tile(
-            w_fp4_q, w_fp4_scales, w_fp4_global_scale,
-            fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
-            fp4_row_stride, k, k0);
+            sh_fp4_q_tile, sh_fp4_scales, w_fp4_global_scale,
+            fp4_word_row, fp4_slot_row, x_tile, local_channel, local_n_tile,
+            fp4_words_per_k_chunk(tile.valid_channels));
       } else {
         acc += run_fp8_qweight_k_tile(
             sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
@@ -482,7 +573,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
 
     if (active) {
       if (tile.kind == kTileNVFP4) {
-        acc += run_nvfp4_qweight_k_tile(
+        acc += run_nvfp4_qweight_k_tile_scalar(
             w_fp4_q, w_fp4_scales, w_fp4_global_scale,
             fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
             fp4_row_stride, k, k0);
