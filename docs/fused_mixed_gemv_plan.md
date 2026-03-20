@@ -243,6 +243,14 @@ Observed result on RTX 5090:
   This is separate from the default `SplitK` column, which still measures the
   current runtime heuristic. The explicit columns make it possible to tune the
   FP8 chunk heuristic using data rather than inference.
+- Using those explicit `SK16/SK32` columns on the 7 Qwen3-4B shapes, the
+  current heuristic was updated away from the earlier "tiny FP8 group => wide"
+  rule. The measured pattern on RTX 5090 is the opposite:
+  - `N_fp8 = 128` (`o_proj`, `down_proj`) prefers the narrow `16-K` path
+  - medium FP8 groups (`384-2176`) generally prefer the wide `32-K` path
+  - the very large FP8 group (`4352`) is effectively a wash
+  The runtime rule is therefore now `384 <= N_fp8 < 4096`, which improves the
+  default `SplitK` path without changing either explicit kernel.
 - The main split-K FP8 path now uses a lighter overlap scheme at `16-K` chunk
   granularity instead of double-buffering an entire `kBlockK=128` qweight tile.
   Concretely, each loop iteration stages one `16-K` FP8 chunk into shared,

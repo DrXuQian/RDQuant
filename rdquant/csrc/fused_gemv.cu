@@ -66,7 +66,8 @@ should_use_staged_nvfp4_splitk_variant(int n_fp4, int n_fp8, int k) {
 
 __host__ __device__ __forceinline__ bool
 should_use_wide_fp8_splitk_variant(int n_fp8, int k) {
-  return n_fp8 <= 128 && k >= 4096;
+  (void)k;
+  return n_fp8 >= 384 && n_fp8 < 4096;
 }
 
 

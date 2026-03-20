@@ -167,6 +167,12 @@ Current progress on this sequence:
 - The Python benchmark now exposes those two variants directly as `SK16` and
   `SK32`, instead of only reporting the heuristic-selected `SplitK` column.
   This makes FP8 chunk heuristic tuning a data problem rather than guesswork.
+- That benchmark data also changed the current heuristic. The older rule
+  assumed very small FP8 groups should take the wide `32-K` chunk path; the
+  measured Qwen3-4B decode shapes show the reverse. The current launch policy
+  now uses the wide FP8 chunk kernel only for medium FP8 groups:
+  - `384 <= N_fp8 < 4096` -> wide `32-K`
+  - otherwise -> narrow `16-K`
 - The latest cleanup step hoists FP8 per-channel scale conversion out of the
   split-K chunk helpers. The helper now consumes a precomputed `half2` scale
   instead of reloading/converting it inside every `16-K` or `32-K` chunk. This
