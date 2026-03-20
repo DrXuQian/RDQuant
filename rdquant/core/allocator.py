@@ -32,7 +32,7 @@ from rdquant.core.sensitivity import compute_rd_points
 from rdquant.core.formats import get_bits_per_element
 
 # Canonical format order: lowest bits first
-_FORMAT_ORDER = ["NVFP4", "FP8", "FP16"]
+_FORMAT_ORDER = ["NVFP4", "INT4", "FP8", "INT8", "FP16"]
 
 # Group alignment: each format group must be a multiple of this many channels
 _GROUP_ALIGNMENT = 128

@@ -5,6 +5,8 @@ Supported formats (NVFP4/FP8/FP16 hierarchy matching vLLM kernel interfaces):
   - NVFP4: E2M1 with per-16-element FP8 E4M3 block scale + per-tensor FP32 global scale
   - FP8:   E4M3 with per-channel FP32 scale
   - FP16:  Passthrough (no quantization)
+  - INT4:  Symmetric per-group (group_size=128) quantization, range [-8, 7]
+  - INT8:  Symmetric per-channel quantization, range [-128, 127]
 
 Each format exposes:
   - bits_per_element: int -- the nominal bit-width (4, 8, 16)
@@ -227,6 +229,101 @@ def fp16_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# INT4 (symmetric per-group, group_size=128, range [-8, 7])
+# ---------------------------------------------------------------------------
+
+_INT4_GROUP_SIZE = 128
+
+
+def int4_quantize(tensor: torch.Tensor) -> QuantizedTensor:
+    """Quantize a 1D tensor to INT4 symmetric with per-group scale (group_size=128).
+
+    Args:
+        tensor: 1D float tensor.
+
+    Returns:
+        QuantizedTensor with data=int8 (values -8..7), scales=per-group float32.
+    """
+    original_shape = tensor.shape
+    flat = tensor.flatten().float()
+    n = flat.shape[0]
+    group_size = _INT4_GROUP_SIZE
+
+    pad = (-n) % group_size
+    if pad > 0:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=flat.dtype, device=flat.device)])
+
+    groups = flat.view(-1, group_size)  # [n_groups, group_size]
+    absmax = groups.abs().amax(dim=1)   # [n_groups]
+    scale = absmax / 7.0
+    scale[scale == 0] = 1.0
+
+    quantized = (groups / scale.unsqueeze(1)).round().clamp(-8, 7)
+    data = quantized.flatten()[:n].to(torch.int8)
+
+    return QuantizedTensor(
+        data=data,
+        scales=scale,
+        format_name="INT4",
+        original_shape=original_shape,
+        bits_per_element=4,
+    )
+
+
+def int4_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
+    """Dequantize INT4 QuantizedTensor back to float32."""
+    data = qtensor.data.float()
+    scales = qtensor.scales
+    n = data.shape[0]
+    group_size = _INT4_GROUP_SIZE
+
+    pad = (-n) % group_size
+    if pad > 0:
+        data = torch.cat([data, torch.zeros(pad, dtype=data.dtype, device=data.device)])
+
+    groups = data.view(-1, group_size)
+    result = groups * scales.to(groups.device).unsqueeze(1)
+    return result.flatten()[:n].reshape(qtensor.original_shape)
+
+
+# ---------------------------------------------------------------------------
+# INT8 (symmetric per-channel, range [-128, 127])
+# ---------------------------------------------------------------------------
+
+def int8_quantize(tensor: torch.Tensor) -> QuantizedTensor:
+    """Quantize a 1D tensor to INT8 symmetric with per-channel (single) scale.
+
+    Args:
+        tensor: 1D float tensor.
+
+    Returns:
+        QuantizedTensor with data=int8 (values -128..127), scales=[1] float32.
+    """
+    original_shape = tensor.shape
+    t = tensor.float()
+    amax = t.abs().max().item()
+    scale = amax / 127.0
+    if scale == 0:
+        scale = 1.0
+
+    quantized = (t / scale).round().clamp(-128, 127).to(torch.int8)
+
+    return QuantizedTensor(
+        data=quantized,
+        scales=torch.tensor([scale], dtype=torch.float32, device=tensor.device),
+        format_name="INT8",
+        original_shape=original_shape,
+        bits_per_element=8,
+    )
+
+
+def int8_dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
+    """Dequantize INT8 QuantizedTensor back to float32."""
+    scale = qtensor.scales.item()
+    return (qtensor.data.float() * scale).reshape(qtensor.original_shape)
+
+
+# ---------------------------------------------------------------------------
 # Unified format registry
 # ---------------------------------------------------------------------------
 
@@ -245,6 +342,16 @@ _FORMATS: dict[str, dict] = {
         "bits_per_element": 16,
         "quantize": fp16_quantize,
         "dequantize": fp16_dequantize,
+    },
+    "INT4": {
+        "bits_per_element": 4,
+        "quantize": int4_quantize,
+        "dequantize": int4_dequantize,
+    },
+    "INT8": {
+        "bits_per_element": 8,
+        "quantize": int8_quantize,
+        "dequantize": int8_dequantize,
     },
 }
 

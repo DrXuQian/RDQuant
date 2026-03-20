@@ -131,6 +131,7 @@ class Int4FusedLinear(torch.nn.Module):
         inv_perm: torch.Tensor,      # [N_total] int64
         bias: Optional[torch.Tensor] = None,
         group_size: int = 128,
+        awq_scales: Optional[torch.Tensor] = None,  # [K] AWQ per-input-channel scales
     ):
         super().__init__()
 
@@ -162,6 +163,14 @@ class Int4FusedLinear(torch.nn.Module):
         # For fake-quant, just dequant the original INT8 directly
         int8_deq = w_int8.float() * s_int8.unsqueeze(1)
 
+        # If AWQ scales provided, undo the scaling on dequantized weights:
+        # We quantized W' = W * α, so dequant gives Q(W*α).
+        # To recover approximate W, divide by α: W_deq = Q(W*α) / α
+        if awq_scales is not None:
+            alpha = awq_scales.float().unsqueeze(0)  # [1, K]
+            int4_deq = int4_deq / alpha
+            int8_deq = int8_deq / alpha
+
         # Store dequantized weights for fake-quant forward
         self.register_buffer('w_int4_deq', int4_deq.half())
         self.register_buffer('w_int8_deq', int8_deq.half())
@@ -170,6 +179,12 @@ class Int4FusedLinear(torch.nn.Module):
 
         # Store packed combined weight for future Marlin integration
         self.register_buffer('w_combined_uint4', w_combined)
+
+        # Store AWQ scales for use in forward pass
+        if awq_scales is not None:
+            self.register_buffer('awq_scales', awq_scales.float())
+        else:
+            self.awq_scales = None
 
         if bias is not None:
             self.bias = torch.nn.Parameter(bias)
@@ -182,7 +197,9 @@ class Int4FusedLinear(torch.nn.Module):
         TODO: Replace with single Marlin INT4 kernel + post-process.
         """
         orig_shape = x.shape
-        x_2d = x.reshape(-1, self.K)
+        # Match input dtype to stored weight dtype
+        w_dtype = self.w_int4_deq.dtype if self.N_int4 > 0 else self.w_int8_deq.dtype
+        x_2d = x.reshape(-1, self.K).to(w_dtype)
 
         # INT4 group
         y_int4 = F.linear(x_2d, self.w_int4_deq)  # [M, N_int4]
