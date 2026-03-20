@@ -57,6 +57,11 @@ Implemented:
   Marlin-style tile engine without rewriting the outer split-K scheduler again.
   The current implementation is now explicitly routed through scalar backends,
   so future Marlin-style replacements can land behind the same wrapper names.
+- The first actual vectorized replacement is now on the FP8 side:
+  `run_fp8_qweight_k_tile(...)` uses `half2` fragment multiplies instead of
+  four scalar multiply-adds per packed FP8 word. This is not the full Marlin
+  tile engine yet, but it moves the active FP8 backend one step closer to the
+  fragment-oriented Marlin compute path.
 
 Observed result on RTX 5090:
 

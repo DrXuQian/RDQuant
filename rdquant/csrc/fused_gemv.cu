@@ -210,7 +210,11 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
   return acc;
 }
 
-__device__ __forceinline__ float run_fp8_qweight_k_tile_scalar(
+__device__ __forceinline__ float sum_half2(half2 x) {
+  return __half2float(__low2half(x)) + __half2float(__high2half(x));
+}
+
+__device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
     const int32_t* __restrict__ w_fp8_q,
     const float* __restrict__ w_fp8_scales,
     const int32_t* __restrict__ fp8_word_row,
@@ -220,31 +224,26 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_scalar(
     int fp8_row_stride,
     int k0) {
   float acc = 0.0f;
-  float channel_scale = w_fp8_scales[channel];
+  const half2 scale_h2 = __float2half2_rn(w_fp8_scales[channel]);
 
   #pragma unroll
   for (int kk = 0; kk < kBlockK; kk += 16) {
-    int row_base = ((k0 + kk) / 16) * fp8_row_stride + n_tile * 256;
+    const int row_base = ((k0 + kk) / 16) * fp8_row_stride + n_tile * 256;
     #pragma unroll
     for (int group = 0; group < 4; ++group) {
       half2 frag_b[2];
-      int packed = w_fp8_q[row_base + fp8_word_row[group]];
+      const int packed = w_fp8_q[row_base + fp8_word_row[group]];
       dequant_fp8_word_to_half2_pairs(packed, frag_b);
 
-      int sub = group * 2;
-      half x0 = x_tile[kk + sub];
-      half x1 = x_tile[kk + sub + 1];
-      half x8 = x_tile[kk + sub + 8];
-      half x9 = x_tile[kk + sub + 9];
+      frag_b[0] = __hmul2(frag_b[0], scale_h2);
+      frag_b[1] = __hmul2(frag_b[1], scale_h2);
 
-      acc += __half2float(__low2half(frag_b[0])) * __half2float(x0) *
-             channel_scale;
-      acc += __half2float(__high2half(frag_b[0])) * __half2float(x1) *
-             channel_scale;
-      acc += __half2float(__low2half(frag_b[1])) * __half2float(x8) *
-             channel_scale;
-      acc += __half2float(__high2half(frag_b[1])) * __half2float(x9) *
-             channel_scale;
+      const int sub = group * 2;
+      const half2 x01 = __halves2half2(x_tile[kk + sub], x_tile[kk + sub + 1]);
+      const half2 x89 = __halves2half2(x_tile[kk + sub + 8], x_tile[kk + sub + 9]);
+
+      acc += sum_half2(__hmul2(frag_b[0], x01));
+      acc += sum_half2(__hmul2(frag_b[1], x89));
     }
   }
 
@@ -280,7 +279,7 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile(
     int n_tile,
     int fp8_row_stride,
     int k0) {
-  return run_fp8_qweight_k_tile_scalar(
+  return run_fp8_qweight_k_tile_half2(
       w_fp8_q, w_fp8_scales, fp8_word_row, x_tile, channel, n_tile,
       fp8_row_stride, k0);
 }
