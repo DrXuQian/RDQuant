@@ -70,3 +70,33 @@ void cublas_mx_gemm_w4a8( // MXFP8 act × MXFP4 weight
 void cublas_mx_gemm_w6a8( // MXFP8 act × MXFP6 weight
     const void *A, const void *A_sf, const void *B, const void *B_sf,
     int M, int N, int K, void *C);
+
+// Fused mixed-precision GEMV for M=1 decode (NVFP4 + FP8 in one launch)
+void fused_mixed_gemv(
+    const void *x,               // [1, K] FP16 activation
+    const void *w_fp4,           // [N_fp4, K/2] packed FP4 E2M1 nibbles
+    const void *w_fp4_scales,    // [N_fp4, K/16] FP8 E4M3 block scales
+    float w_fp4_global_scale,    // scalar global scale for FP4 weights
+    const void *w_fp8,           // [N_fp8, K] FP8 E4M3 weights
+    const void *w_fp8_scales,    // [N_fp8] per-channel FP32 scales
+    const void *inv_perm,        // [N_fp4+N_fp8] output permutation (int32)
+    void *y,                     // [1, N_fp4+N_fp8] FP16 output
+    int N_fp4, int N_fp8, int K
+);
+
+// Fused mixed-precision GEMV using Marlin-repacked qweights and plain scales.
+// This is a transition kernel used to validate mixed scheduling and Marlin
+// qweight address formulas before switching to Marlin's full inner loop.
+void fused_mixed_gemv_marlin_weights(
+    const void *x,               // [1, K] FP16 activation
+    const void *w_fp4_q,         // [K/16, N_fp4*2] int32 Marlin qweight
+    const void *w_fp4_scales,    // [N_fp4, K/16] FP8 E4M3 block scales
+    float w_fp4_global_scale,    // scalar global scale for FP4 weights
+    const void *w_fp8_q,         // [K/16, N_fp8*4] int32 Marlin qweight
+    const void *w_fp8_scales,    // [N_fp8] FP32 channel scales
+    const void *fp4_perm_map,    // [1024] int32 inverse map for one 16x64 tile
+    const void *fp8_perm_map,    // [1024] int32 inverse map for one 16x64 tile
+    const void *inv_perm,        // [N_fp4+N_fp8] output permutation (int32)
+    void *y,                     // [1, N_fp4+N_fp8] FP16 output
+    int N_fp4, int N_fp8, int K
+);

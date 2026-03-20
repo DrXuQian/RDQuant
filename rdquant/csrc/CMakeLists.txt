@@ -39,6 +39,7 @@ add_library(rdquant_cuda MODULE
     w8a8.cu
     sf_layout.cu
     cublas_mxfp8.cu
+    fused_gemv.cu
 )
 
 target_include_directories(rdquant_cuda PRIVATE
