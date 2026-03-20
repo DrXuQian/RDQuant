@@ -44,6 +44,14 @@ Quantization reduces the memory footprint and, more importantly, the bandwidth c
 The dominant approach in practice is \emph{uniform quantization}: every weight matrix is quantized to a single format, whether GPTQ~\cite{frantar2022gptq}, AWQ~\cite{lin2024awq}, or the hardware-native NVFP4 format on NVIDIA Blackwell GPUs~\cite{nvidia2024fp4}.
 Uniform quantization is simple and efficient but wasteful: in a typical transformer, some output channels contain large outlier weights that dominate the block scale in sub-channel formats like NVFP4, crushing the majority of small values in the same block.
 Other channels are nearly uniform and can be aggressively quantized with negligible error.
+Figure~\ref{fig:mse_dist} illustrates this variance on a representative layer.
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{figures/fig1_mse_distribution.pdf}
+\caption{Per-channel NVFP4 vs FP8 quantization MSE distribution for \texttt{layers.20.self\_attn.q\_proj} in Qwen3-4B (4096 output channels). NVFP4 MSE spans two orders of magnitude across channels (CV=0.89), while FP8 MSE is tightly concentrated. This variance is what R-D allocation exploits.}
+\label{fig:mse_dist}
+\end{figure}
+
 
 We propose \textbf{RDQuant}, a \emph{rate--distortion} (R-D) optimal framework for per-output-channel mixed-precision quantization.
 Given a target average bit rate, RDQuant solves a Lagrangian relaxation to assign each output channel to one of three hardware-native formats (NVFP4, FP8, FP16), minimizing total quantization distortion subject to a global bit budget.
@@ -175,11 +183,25 @@ This importance has three multiplicative factors: (i) the Hessian $h_j$ (how muc
 \end{corollary}
 
 \paragraph{Simplification.}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{figures/fig4_importance.pdf}
+\caption{Per-layer importance: weight MSE (data-free) vs activation norm across 252 layers. Activation norm grows monotonically with depth (residual stream accumulation), making it a poor importance proxy. Weight MSE varies non-monotonically and better reflects actual quantization sensitivity.}
+\label{fig:importance}
+\end{figure}
 In our data-free mode, we set $h_j = 1$ and $s_k^2 = 1$ for all $j, k$ (uniform importance), reducing Eq.~\eqref{eq:importance} to:
 $I_j^{\text{free}} = \sum_k \text{MSE}_{j,k}(f_j) = K \cdot \overline{\text{MSE}}_j(f_j)$,
 which is the row-wise weight MSE used in our R-D allocation.
 In calibrated mode, the perturb metric directly measures $\mathbb{E}[\Delta\mathcal{L}]$ for each layer, capturing the product $h_j \cdot s_k^2$ empirically without separate estimation.
 
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{figures/fig6_outlier_scatter.pdf}
+\caption{Per-channel outlier ratio ($\max|w|/\mathrm{std}(w)$) vs NVFP4 MSE for four representative layers. Higher outlier ratio generally correlates with higher MSE, but the relationship is noisy---direct MSE computation (as in R-D allocation) is more reliable than heuristic outlier metrics.}
+\label{fig:outlier_scatter}
+\end{figure}
 \paragraph{Block-scaled quantization model.}
 We now characterize $\text{MSE}_{j,k}(f_j)$ for block-scaled formats.
 In NVFP4, the weight vector is partitioned into blocks of size $B = 16$.
@@ -238,6 +260,13 @@ Channels without outliers (small $m/\sigma$) can remain at NVFP4 with negligible
 The optimal assignment depends on the \emph{marginal rate--distortion tradeoff}: whether the distortion reduction from upgrading a channel to FP8 justifies the $4$-bit cost.
 \end{remark}
 
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{figures/fig2_rd_curve.pdf}
+\caption{Rate--distortion curve on Qwen3-4B (WikiText-2 PPL). RDQuant calibrated at 5.29 bpw achieves lower PPL than BF16 at 16 bpw. The gap between uniform NVFP4 (single point at 4 bpw) and the RDQuant curve shows the benefit of mixed-precision allocation.}
+\label{fig:rd_curve}
+\end{figure}
 \subsection{Rate--Distortion Optimal Allocation}
 \label{sec:rd}
 
@@ -319,6 +348,13 @@ $\lambda_\text{lo} \leftarrow 0$, $\lambda_\text{hi} \leftarrow \lambda_\text{ma
 \Return{$\{f_{\ell,j}\}$, quantized weights, permutation indices}
 \end{algorithm}
 
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig3_allocation.pdf}
+\caption{Per-layer format allocation at 5.3 bpw (data-free) across all 252 linear layers of Qwen3-4B. \texttt{down\_proj} and \texttt{o\_proj} layers are predominantly NVFP4 (easy to quantize), while \texttt{v\_proj} layers are mostly FP8 (more sensitive). The global $\lambda$-sweep automatically discovers this heterogeneity.}
+\label{fig:allocation}
+\end{figure*}
 \subsection{Calibrated Layer Importance}
 \label{sec:calibrated}
 
@@ -406,6 +442,13 @@ RDQuant targets three hardware-native formats:
 
 This format hierarchy matches the interfaces of production inference kernels: vLLM's \texttt{marlin\_gemm} supports both NVFP4 and FP8, while \texttt{cutlass\_scaled\_mm} provides FP8 W8A8 support.
 
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\columnwidth]{figures/fig5_latency.pdf}
+\caption{End-to-end inference latency on Qwen3-4B (RTX 5090). CUDA Graph eliminates Python dispatch overhead, achieving 2.59$\times$ decode speedup and 1.25$\times$ prefill speedup over BF16.}
+\label{fig:latency}
+\end{figure}
 \subsection{Inference Architecture}
 
 For each linear layer, RDQuant executes:
