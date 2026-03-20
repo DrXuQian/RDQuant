@@ -44,6 +44,18 @@ struct TileDesc {
   int logical_base;
 };
 
+__host__ __device__ __forceinline__ bool
+should_use_staged_nvfp4_splitk_variant(int n_fp4, int n_fp8, int k) {
+  (void)k;
+  const int num_tiles = (n_fp4 + kBlockN - 1) / kBlockN +
+                        (n_fp8 + kBlockN - 1) / kBlockN;
+  const int num_fp8_tiles = (n_fp8 + kBlockN - 1) / kBlockN;
+  if (num_tiles <= 8 && num_fp8_tiles >= 2) {
+    return true;
+  }
+  return false;
+}
+
 static __constant__ float c_fp4_lut[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -934,4 +946,35 @@ void fused_mixed_gemv_marlin_weights_splitk_staged_nvfp4(
       n_fp8,
       k,
       parallel_k);
+}
+
+void fused_mixed_gemv_marlin_weights_splitk_auto(
+    const void* x,
+    const void* w_fp4_q,
+    const void* w_fp4_scales,
+    float w_fp4_global_scale,
+    const void* w_fp8_q,
+    const void* w_fp8_scales,
+    const void* fp4_word_offsets,
+    const void* fp4_slot_map,
+    const void* fp8_word_offsets,
+    const void* inv_perm,
+    void* workspace,
+    void* tile_counters,
+    void* y,
+    int n_fp4,
+    int n_fp8,
+    int k,
+    int parallel_k) {
+  if (should_use_staged_nvfp4_splitk_variant(n_fp4, n_fp8, k)) {
+    fused_mixed_gemv_marlin_weights_splitk_staged_nvfp4(
+        x, w_fp4_q, w_fp4_scales, w_fp4_global_scale, w_fp8_q, w_fp8_scales,
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets, inv_perm, workspace,
+        tile_counters, y, n_fp4, n_fp8, k, parallel_k);
+  } else {
+    fused_mixed_gemv_marlin_weights_splitk(
+        x, w_fp4_q, w_fp4_scales, w_fp4_global_scale, w_fp8_q, w_fp8_scales,
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets, inv_perm, workspace,
+        tile_counters, y, n_fp4, n_fp8, k, parallel_k);
+  }
 }

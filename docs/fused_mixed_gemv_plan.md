@@ -94,6 +94,13 @@ Implemented:
   not a uniform win: it helps some low-tile-count shapes (`k_proj`, `v_proj`,
   `down_proj`) but regresses others. The current benchmark now prints both
   variants and a per-layer `BestSK` result instead of forcing one policy.
+- There is now also a small `splitk_auto` wrapper that dispatches between the
+  two split-K variants with a conservative runtime heuristic. The current rule
+  only sends shapes with very small total tile count and a non-trivial FP8 tile
+  set to the `staged NVFP4` variant; everything else stays on the original
+  scalar-NVFP4 path. This is intentionally narrower than the raw `BestSK`
+  benchmark table because the per-shape timing deltas are small enough that a
+  more aggressive heuristic is not robust yet.
 
 Observed result on RTX 5090:
 
@@ -200,6 +207,10 @@ Observed result on RTX 5090:
   This gives a current best-of-two total of roughly `277us` across the 7 target
   layers, which is modestly better than forcing the original split-K path on
   every layer.
+- The benchmark now also fixes the random seed before generating test tensors.
+  This removes one avoidable source of run-to-run jitter, which matters when
+  comparing the two split-K variants because several of the per-layer deltas are
+  only on the order of `0.5-1us`.
 - A smoke benchmark after extracting those dtype-specific tile entry points
   still passes correctness and preserves the same qualitative ranking:
   split-K remains far ahead of the base fused kernel, so this refactor is a

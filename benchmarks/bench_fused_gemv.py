@@ -24,6 +24,7 @@ import rdquant_cuda
 
 DEVICE = "cuda"
 K_TILE = 128
+BENCH_SEED = 20260320
 
 # Qwen3-4B mixed layers: (name, N_total, K, N_fp4, N_fp8)
 QWEN3_4B_SHAPES = [
@@ -418,6 +419,8 @@ def make_test_data(N_fp4, N_fp8, K, device=DEVICE):
 
 def test_correctness():
     """Verify fused GEMV matches dequant reference."""
+    torch.manual_seed(BENCH_SEED)
+    torch.cuda.manual_seed_all(BENCH_SEED)
     print("=" * 60)
     print("Correctness test")
     print("=" * 60)
@@ -467,6 +470,16 @@ def test_correctness():
         data["inv_perm"], workspace_staged, tile_counters_staged,
         N_fp4, N_fp8, K, parallel_k
     )
+    workspace_auto = torch.zeros_like(workspace)
+    tile_counters_auto = torch.zeros_like(tile_counters)
+    y_splitk_auto = rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_auto(
+        x,
+        w_fp4_q, data["w_fp4_scales"], data["global_scale"],
+        w_fp8_q, data["w_fp8_scales"],
+        fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+        data["inv_perm"], workspace_auto, tile_counters_auto,
+        N_fp4, N_fp8, K, parallel_k
+    )
     y_marlin = run_marlin_mixed(
         x, w_fp4_q, marlin_fp4_scales, marlin_global_scale, marlin_ws4, N_fp4,
         w_fp8_q, marlin_fp8_scales, marlin_ws8, N_fp8, K, data["inv_perm"]
@@ -482,6 +495,8 @@ def test_correctness():
     splitk_mean_err = (y_splitk.float() - y_ref.float()).abs().mean().item()
     splitk_staged_max_err = (y_splitk_staged.float() - y_ref.float()).abs().max().item()
     splitk_staged_mean_err = (y_splitk_staged.float() - y_ref.float()).abs().mean().item()
+    splitk_auto_max_err = (y_splitk_auto.float() - y_ref.float()).abs().max().item()
+    splitk_auto_mean_err = (y_splitk_auto.float() - y_ref.float()).abs().mean().item()
     marlin_max_err = (y_marlin.float() - y_ref.float()).abs().max().item()
     marlin_mean_err = (y_marlin.float() - y_ref.float()).abs().mean().item()
     ref_norm = y_ref.float().abs().mean().item()
@@ -493,14 +508,17 @@ def test_correctness():
     print(f"  Split-K mean absolute error:{splitk_mean_err:.6f}")
     print(f"  Split-K-S4 max abs error:  {splitk_staged_max_err:.6f}")
     print(f"  Split-K-S4 mean abs error: {splitk_staged_mean_err:.6f}")
+    print(f"  Split-K-Auto max abs err: {splitk_auto_max_err:.6f}")
+    print(f"  Split-K-Auto mean err:    {splitk_auto_mean_err:.6f}")
     print(f"  2xMarlin max abs error:    {marlin_max_err:.6f}")
     print(f"  2xMarlin mean abs error:   {marlin_mean_err:.6f}")
     print(f"  Reference mean |y|:  {ref_norm:.6f}")
     print(f"  Base relative error: {mean_err / (ref_norm + 1e-8):.4%}")
     print(f"  Split-K rel. error:  {splitk_mean_err / (ref_norm + 1e-8):.4%}")
     print(f"  Split-K-S4 rel. err: {splitk_staged_mean_err / (ref_norm + 1e-8):.4%}")
+    print(f"  Split-K-Auto rel.err:{splitk_auto_mean_err / (ref_norm + 1e-8):.4%}")
     print(f"  2xMarlin rel. error: {marlin_mean_err / (ref_norm + 1e-8):.4%}")
-    ok = max(max_err, splitk_max_err, splitk_staged_max_err, marlin_max_err) < 0.5
+    ok = max(max_err, splitk_max_err, splitk_staged_max_err, splitk_auto_max_err, marlin_max_err) < 0.5
     print(f"  Status: {'PASS' if ok else 'FAIL'}")
     print()
     return ok
@@ -513,12 +531,15 @@ def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
     print("=" * 60)
     print(f"{'Layer':<14} {'N':>6} {'K':>6} {'N4':>5} {'N8':>5} "
           f"{'cuBLAS':>8} {'Mrl4':>8} {'Mrl8':>8} {'M4+8':>8} {'2xMrl':>8} "
-          f"{'Base':>8} {'SplitK':>8} {'Split4S':>8} {'BestSK':>8} {'P_K':>5} {'Mode':>8}")
-    print("-" * 164)
+          f"{'Base':>8} {'SplitK':>8} {'Split4S':>8} {'AutoSK':>8} {'BestSK':>8} {'P_K':>5} {'Mode':>8}")
+    print("-" * 176)
 
     fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps()
 
-    for name, N, K, N_fp4, N_fp8 in QWEN3_4B_SHAPES:
+    for shape_idx, (name, N, K, N_fp4, N_fp8) in enumerate(QWEN3_4B_SHAPES):
+        seed = BENCH_SEED + shape_idx
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
         N_total = N_fp4 + N_fp8
         num_tiles = (N_fp4 + 127) // 128 + (N_fp8 + 127) // 128
 
@@ -594,12 +615,25 @@ def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
             warmup=warmup,
             repeat=repeat,
         )
+        workspace_auto = torch.zeros_like(workspace)
+        tile_counters_auto = torch.zeros_like(tile_counters)
+        t_splitk_auto = bench(
+            lambda: rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_auto(
+                x_fp16, w_fp4_q, w_fp4_scales, 1.0,
+                w_fp8_q, w_fp8_scales,
+                fp4_word_offsets, fp4_slot_map, fp8_word_offsets,
+                inv_perm, workspace_auto, tile_counters_auto,
+                N_fp4, N_fp8, K, parallel_k
+            ),
+            warmup=warmup,
+            repeat=repeat,
+        )
         best_splitk = min(t_splitk, t_splitk_staged)
         best_mode = "scalar" if t_splitk <= t_splitk_staged else "stg4"
         print(f"{name:<14} {N:>6} {K:>6} {N_fp4:>5} {N_fp8:>5} "
               f"{t_cublas:>7.1f}us {t_marlin_fp4:>7.1f}us {t_marlin_fp8:>7.1f}us "
               f"{t_marlin_sum:>7.1f}us {t_marlin:>7.1f}us {t_fused:>7.1f}us "
-              f"{t_splitk:>7.1f}us {t_splitk_staged:>8.1f}us {best_splitk:>8.1f}us "
+              f"{t_splitk:>7.1f}us {t_splitk_staged:>8.1f}us {t_splitk_auto:>8.1f}us {best_splitk:>8.1f}us "
               f"{parallel_k:>5} {best_mode:>8}")
 
     print()

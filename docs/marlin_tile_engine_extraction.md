@@ -121,6 +121,11 @@ Current progress on this sequence:
   - an alternate staged-NVFP4 path
   The staged-NVFP4 variant is not a uniform win, so both are kept visible in
   the benchmark instead of prematurely replacing the previous best path.
+- RDQuant now also has a conservative wrapper that chooses between those two
+  split-K variants at launch time. This is not meant to be the final solution;
+  it is just a way to preserve the measured win on the few small-tile shapes
+  where the staged-NVFP4 path helps, without forcing that path on the broader
+  set of layers where the original scalar-NVFP4 split-K kernel remains better.
 - The staged qweight loaders now use 16-byte vector copies. This is still not
   Marlin's full multi-stage pipeline, but the loader itself is now using the
   same `cp.async` family of primitives instead of plain vector stores.
