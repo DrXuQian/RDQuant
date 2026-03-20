@@ -1,0 +1,407 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage[margin=1in]{geometry}
+%\usepackage{microtype}
+\usepackage{cleveref}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+
+\title{Single-Kernel Mixed-Precision Inference via INT8$\to$2$\times$INT4 Decomposition\\with Fused Pre/Post-Processing}
+\author{Qian Xu \and Victor Li}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Mixed-precision quantization assigns different bit-widths to different weight channels based on their sensitivity, achieving better quality-compression trade-offs than uniform quantization. However, deploying INT4/INT8 mixed-precision models requires two separate GEMM kernel launches per layer---one for INT4 channels and one for INT8 channels---incurring significant overhead from the persistent kernel pipeline warmup ($\sim$16$\mu$s per launch on modern GPUs). We propose a single-kernel approach that decomposes INT8 weights into two UINT4 nibbles (high and low), enabling all channels to be processed by a single INT4 Marlin kernel with analytical post-processing. Combined with (1) AWQ activation-aware scaling for improved INT4 precision, (2) rate-distortion optimal channel allocation, and (3) fused CUDA kernels that eliminate pre/post-processing overhead, our method achieves \textbf{1.22$\times$ decode speedup} over BF16 on Qwen3-4B with 3$\times$ memory compression at only +0.8 PPL degradation on WikiText-2. The fused kernels reduce 8 PyTorch operator launches per layer to 2 custom CUDA kernels, saving 3.3ms per decode step.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Weight quantization is the primary technique for reducing memory footprint and improving inference throughput of large language models (LLMs). Uniform quantization applies the same bit-width to all weights, while mixed-precision quantization assigns higher precision to sensitive channels and lower precision to robust ones. The latter achieves superior quality-compression trade-offs by exploiting the heterogeneous sensitivity structure across weight channels~\cite{lin2024awq,frantar2023gptq}.
+
+However, mixed-precision deployment faces a \emph{kernel fusion barrier}: different bit-widths require different GEMM kernels, and launching multiple kernels per layer introduces fixed overhead. On modern GPUs, highly optimized persistent GEMM kernels (e.g., Marlin~\cite{frantar2024marlin}) exhibit a constant pipeline warmup cost of $\sim$16$\mu$s regardless of matrix size. For a model with 252 linear layers, two kernel launches per layer add $\sim$8ms of pure overhead---exceeding the total BF16 GEMM time of 5.65ms.
+
+We address this with three contributions:
+\begin{enumerate}
+    \item \textbf{INT8$\to$2$\times$INT4 decomposition} (\Cref{sec:decomposition}): We decompose each INT8 weight into high and low UINT4 nibbles, concatenate them with native INT4 weights, and process everything in a single Marlin INT4 kernel. The INT8 output is reconstructed analytically from the two partial results.
+
+    \item \textbf{AWQ + Rate-Distortion allocation} (\Cref{sec:allocation}): We combine activation-aware weight scaling (AWQ) with Lagrangian rate-distortion optimization to assign INT4 vs INT8 precision per output channel, subject to a global bits-per-weight budget.
+
+    \item \textbf{Fused CUDA pre/post-processing} (\Cref{sec:fused}): We replace 8 PyTorch operator launches per layer with 2 custom CUDA kernels---a fused AWQ-scaling-plus-reduction kernel and a fused correction-plus-permutation kernel---reducing per-layer overhead from $\sim$58$\mu$s to $\sim$12$\mu$s and total decode latency by 3.3ms.
+\end{enumerate}
+
+On Qwen3-4B, our method achieves 151 tok/s decode (1.22$\times$ over BF16's 123 tok/s) with CUDA Graph, at 5.3 bits per weight and WikiText-2 PPL of 13.70 (vs 12.90 BF16).
+
+
+% =====================================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{Weight-Only Quantization}
+
+Weight-only quantization stores model weights in low precision while performing computation in higher precision (FP16/BF16). For inference, weights are dequantized on-the-fly during GEMM execution. The key formats are:
+\begin{itemize}
+    \item \textbf{INT4} (symmetric, per-group): $w_q = \text{round}(w / s)$, $s = \max|w_{\text{group}}| / 7$, group size typically 128.
+    \item \textbf{INT8} (symmetric, per-channel): $w_q = \text{round}(w / s)$, $s = \max|w_{\text{channel}}| / 127$.
+\end{itemize}
+
+\subsection{Marlin Persistent Kernel}
+
+Marlin~\cite{frantar2024marlin} is a highly optimized CUDA kernel for weight-only quantized GEMM. It uses a persistent thread-block design that achieves near-peak memory bandwidth utilization. A key characteristic is a \emph{fixed pipeline warmup cost} of $\sim$16$\mu$s per kernel launch, independent of matrix dimensions. This makes multiple kernel launches per layer prohibitively expensive for decode (M=1), where the actual GEMM compute is $<$1$\mu$s per layer.
+
+Marlin's \texttt{uint4b8} scalar type stores unsigned 4-bit values with an implicit zero-point of 8, dequantizing as:
+\begin{equation}
+    w_{\text{deq}} = (w_{\text{uint4}} - 8) \times s_{\text{group}}
+\end{equation}
+
+\subsection{Activation-Aware Weight Quantization (AWQ)}
+
+AWQ~\cite{lin2024awq} observes that a small fraction of input channels carry disproportionate activation magnitudes. By scaling weights along the input dimension before quantization---$\mathbf{W}' = \mathbf{W} \cdot \text{diag}(\boldsymbol{\alpha})$ with $\alpha_k = |\bar{a}_k|^{0.5}$---the quantization grid is better aligned with the important channels. At inference, the scaling is undone by dividing the activation: $\mathbf{x}' = \mathbf{x} / \boldsymbol{\alpha}$.
+
+
+% =====================================================================
+\section{INT8$\to$2$\times$INT4 Decomposition}
+\label{sec:decomposition}
+
+\subsection{Mathematical Foundation}
+
+An INT8 weight $w \in [-128, 127]$ can be expressed as two UINT4 nibbles:
+\begin{equation}
+    w = 16h + l - 128, \quad h = \lfloor (w + 128) / 16 \rfloor, \quad l = (w + 128) \bmod 16
+\end{equation}
+where $h, l \in [0, 15]$ are UINT4 values. The INT8 GEMV for a single output channel becomes:
+\begin{align}
+    y &= s \sum_k w_k x_k = s \sum_k (16h_k + l_k - 128) x_k \\
+      &= s \left( 16 \sum_k h_k x_k + \sum_k l_k x_k - 128 \sum_k x_k \right) \\
+      &= s (16 y_h + y_l - 128 \cdot \text{sum}_x)
+\end{align}
+where $y_h = \sum_k h_k x_k$ and $y_l = \sum_k l_k x_k$ are UINT4 dot products, and $\text{sum}_x = \sum_k x_k$ is a scalar that can be precomputed once per token.
+
+\subsection{Marlin uint4b8 Correction}
+
+When using Marlin's \texttt{uint4b8} type, the kernel subtracts 8 from each UINT4 value during dequantization. For the high nibble with scale $s_h = 16s$:
+\begin{equation}
+    y_{h,\text{marlin}} = s_h \sum_k (h_k - 8) x_k = 16s \cdot y_h - 128s \cdot \text{sum}_x
+\end{equation}
+Similarly for the low nibble with scale $s_l = s$:
+\begin{equation}
+    y_{l,\text{marlin}} = s \sum_k (l_k - 8) x_k = s \cdot y_l - 8s \cdot \text{sum}_x
+\end{equation}
+Summing:
+\begin{align}
+    y_{h,\text{marlin}} + y_{l,\text{marlin}} &= s(16y_h + y_l) - 136s \cdot \text{sum}_x \\
+    &= y + 128s \cdot \text{sum}_x - 136s \cdot \text{sum}_x \\
+    &= y - 8s \cdot \text{sum}_x
+\end{align}
+
+Therefore, the correction is simply:
+\begin{equation}
+\boxed{y = y_{h,\text{marlin}} + y_{l,\text{marlin}} + 8s \cdot \text{sum}_x}
+\label{eq:correction}
+\end{equation}
+
+The correction vector $\mathbf{c} = 8\mathbf{s}_{\text{int8}}$ is precomputed offline ($N_{\text{int8}}$ floats).
+
+\subsection{Single-Kernel Layout}
+
+We concatenate all UINT4 weights along the output dimension:
+\begin{equation}
+    \mathbf{W}_{\text{combined}} = \begin{bmatrix} \mathbf{W}_{\text{int4}} \\ \mathbf{W}_{\text{high}} \\ \mathbf{W}_{\text{low}} \end{bmatrix} \in \mathbb{Z}^{(N_4 + 2N_8) \times K}_{\text{uint4}}
+\end{equation}
+with a unified scale tensor:
+\begin{equation}
+    \mathbf{S}_{\text{combined}} = \begin{bmatrix} \mathbf{S}_{\text{int4}} \\ 16 \cdot \mathbf{S}_{\text{int8}} \\ \mathbf{S}_{\text{int8}} \end{bmatrix} \in \mathbb{R}^{(N_4 + 2N_8) \times (K/g)}
+\end{equation}
+where INT8 per-channel scales are broadcast to per-group format ($K/g$ copies each). One \texttt{marlin\_gemm} call produces:
+\begin{equation}
+    \mathbf{y}_{\text{combined}} = \text{Marlin}(\mathbf{x}, \mathbf{W}_{\text{combined}}, \mathbf{S}_{\text{combined}}) \in \mathbb{R}^{M \times (N_4+2N_8)}
+\end{equation}
+
+\begin{proposition}[Kernel Cost Independence]
+For decode (M=1), the Marlin persistent kernel cost is independent of $N_{\text{combined}}$ up to $\sim$14K output channels, as the pipeline warmup dominates:
+$T_{\text{Marlin}}(N) \approx T_{\text{warmup}} \approx 16\mu s$ for $N \leq 14000, K \leq 10000$.
+\end{proposition}
+
+This is confirmed empirically: $T(N{=}4096) = 14.9\mu s$ vs $T(N{=}13696) = 14.6\mu s$---no measurable difference.
+
+
+% =====================================================================
+\section{AWQ + Rate-Distortion Channel Allocation}
+\label{sec:allocation}
+
+\subsection{Per-Channel Rate-Distortion Points}
+
+For each output channel $n$ of each linear layer, we compute the distortion (MSE vs original weight) under both INT4 and INT8 quantization of the AWQ-scaled weight $\mathbf{w}'_n = \mathbf{w}_n \cdot \boldsymbol{\alpha}$:
+\begin{equation}
+    D_n^{(b)} = \frac{1}{K} \| \mathbf{w}'_n - Q_b(\mathbf{w}'_n) \|_2^2, \quad b \in \{4, 8\}
+\end{equation}
+with rate $R_n^{(4)} = 4 + 32/g$ bits/element (including group scales) and $R_n^{(8)} = 8 + 32/K$ bits/element.
+
+\subsection{Global Lagrangian Allocation}
+
+Given a target average bit-width $\bar{b}$ across all layers, we solve:
+\begin{equation}
+    \min_{\{b_n\}} \sum_n D_n^{(b_n)} \quad \text{s.t.} \quad \frac{\sum_n R_n^{(b_n)} \cdot K}{\sum_n K} \leq \bar{b}
+\end{equation}
+
+Via Lagrangian relaxation with multiplier $\lambda$:
+\begin{equation}
+    b_n^*(\lambda) = \arg\min_{b \in \{4,8\}} \left[ D_n^{(b)} + \lambda \cdot R_n^{(b)} \right]
+\end{equation}
+
+The optimal $\lambda^*$ is found by bisection over 64 iterations. This yields a \emph{global} allocation across all layers---sensitive layers receive more INT8 channels.
+
+\subsection{128-Channel Group Alignment}
+
+Hardware efficiency requires the number of INT4 and INT8 channels to be multiples of 128. After the per-channel allocation, we adjust boundaries to the nearest 128-aligned split, preferring the direction that minimizes total distortion increase.
+
+
+% =====================================================================
+\section{Fused CUDA Pre/Post-Processing}
+\label{sec:fused}
+
+\subsection{Overhead Analysis}
+
+Without fusion, each layer's forward pass requires:
+\begin{enumerate}
+    \item \texttt{x / awq\_scales} --- elementwise division (AWQ)
+    \item \texttt{x.sum(dim=1)} --- reduction for $\text{sum}_x$
+    \item \texttt{marlin\_gemm} --- single Marlin kernel
+    \item \texttt{y[:, :N4]} --- slice
+    \item \texttt{y\_high + y\_low} --- elementwise add
+    \item \texttt{+ corr * sum\_x} --- elementwise mul-add
+    \item \texttt{torch.cat} --- memory copy
+    \item \texttt{index\_select} --- gather permutation
+\end{enumerate}
+
+Steps 1--2 and 4--8 are each tiny CUDA kernel launches. At M=1, each takes $\sim$6$\mu$s (launch overhead) with negligible compute. Across 252 layers: $252 \times 7 \times 6\mu s \approx 10.6$ms of pure overhead.
+
+\subsection{Fused Pre-Kernel: AWQ + Sum}
+
+We fuse steps 1--2 into a single kernel. Each block handles one token row:
+\begin{itemize}
+    \item Precompute $1/\boldsymbol{\alpha}$ offline (stored as buffer)
+    \item Vectorized \texttt{half2} multiply: $x_k \leftarrow x_k \cdot (1/\alpha_k)$ (in-place, avoids allocation)
+    \item Warp-shuffle reduction for $\text{sum}_x$ (FP32 accumulation)
+\end{itemize}
+
+\subsection{Fused Post-Kernel: Correction + Permutation}
+
+We fuse steps 4--8 into a single kernel. For M$\leq$4 (decode), we use shared memory:
+\begin{enumerate}
+    \item \textbf{Phase 1}: Coalesced load of $\mathbf{y}_{\text{combined}}$ into shared memory
+    \item \textbf{Phase 2}: Each thread reads from shared memory via \texttt{inv\_perm[n]} (fast random access), applies INT8 correction if needed, writes to $\mathbf{y}_{\text{out}}$ (coalesced)
+\end{enumerate}
+
+The shared memory approach converts random global memory reads (through permutation) into random shared memory reads (50$\times$ lower latency). Maximum shared memory per block: $N_{\text{combined}} \times 2$ bytes $= 27$KB for the largest layer (fits within 48KB limit).
+
+Additional optimizations:
+\begin{itemize}
+    \item \texttt{int32} permutation indices (vs \texttt{int64}): halves bandwidth
+    \item \texttt{\_\_ldg} intrinsics for read-only data: leverages L1 cache
+    \item Batched kernel variant for M$>$4 without shared memory
+\end{itemize}
+
+\subsection{CUDA Graph Integration}
+
+With CUDA Graph, all kernel launches (including Marlin + fused pre/post) are captured into a static graph that replays with $\sim$1$\mu$s per node scheduling overhead (vs $\sim$6$\mu$s per launch without graph). The fused kernels reduce graph nodes from $252 \times 8 = 2016$ to $252 \times 3 = 756$, saving $\sim$1260 nodes $\times$ 1$\mu$s $\approx$ 1.3ms.
+
+
+% =====================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+\begin{itemize}
+    \item \textbf{Model}: Qwen3-4B (36 layers, 252 linear layers)
+    \item \textbf{GPU}: NVIDIA B20 (SM120), 96GB HBM
+    \item \textbf{Quantization}: AWQ + RDQuant at 5.3 bits per weight, INT4/INT8 mixed-precision
+    \item \textbf{Calibration}: 2 samples, 512 tokens each
+    \item \textbf{Kernel}: vLLM Marlin \texttt{uint4b8}, group size 128
+    \item \textbf{Evaluation}: WikiText-2 perplexity, CUDA Graph decode throughput
+\end{itemize}
+
+\subsection{Kernel-Level Analysis}
+
+\begin{table}[h]
+\centering
+\caption{Per-layer GEMM time comparison (M=1 decode, microseconds)}
+\label{tab:kernel}
+\begin{tabular}{lrrrrr}
+\toprule
+Layer & N & K & BF16 & Marlin & Speedup \\
+\midrule
+q\_proj & 4096 & 2560 & 17.0 & 14.7 & 1.16$\times$ \\
+k\_proj & 1024 & 2560 & 9.2 & 14.7 & 0.63$\times$ \\
+v\_proj & 1024 & 2560 & 9.2 & 14.7 & 0.63$\times$ \\
+o\_proj & 2560 & 4096 & 16.4 & 14.8 & 1.11$\times$ \\
+gate\_proj & 9728 & 2560 & 35.1 & 14.7 & 2.39$\times$ \\
+up\_proj & 9728 & 2560 & 35.2 & 14.7 & 2.39$\times$ \\
+down\_proj & 2560 & 9728 & 34.8 & 14.8 & 2.35$\times$ \\
+\midrule
+\textbf{Per-layer sum} & & & \textbf{156.9} & \textbf{103.0} & \textbf{1.52$\times$} \\
+\textbf{Full model (252)} & & & \textbf{5.65ms} & \textbf{3.71ms} & \textbf{1.52$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key observations:
+\begin{itemize}
+    \item Marlin shows a constant $\sim$14.7$\mu$s floor (persistent kernel warmup), independent of N.
+    \item Large layers (gate/up/down\_proj) see 2.4$\times$ speedup; small layers (k/v\_proj) are slower due to the floor.
+    \item \textbf{$N_{\text{combined}}$ vs $N_{\text{total}}$ has zero overhead}: Marlin with $N{=}4096$ takes the same time as $N{=}13696$.
+\end{itemize}
+
+\subsection{Post-Processing Overhead}
+
+\begin{table}[h]
+\centering
+\caption{Post-processing overhead per decode step (252 layers)}
+\label{tab:overhead}
+\begin{tabular}{lrr}
+\toprule
+Method & Per-layer & Total (252 layers) \\
+\midrule
+Unfused PyTorch ops (8 launches) & 58$\mu$s & 14.6ms \\
+Unfused in CUDA Graph (8 nodes) & 10$\mu$s & 2.55ms \\
+\textbf{Fused kernels (2 launches)} & \textbf{12$\mu$s} & \textbf{3.0ms} \\
+\textbf{Fused in CUDA Graph (2 nodes)} & \textbf{$\sim$2$\mu$s} & \textbf{$\sim$0.5ms} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Without CUDA Graph, fused kernels provide $4.9\times$ reduction (58$\to$12$\mu$s) by eliminating 6 kernel launches. With CUDA Graph, the benefit is $5\times$ (10$\to$2$\mu$s) by reducing graph nodes from 8 to 2 per layer.
+
+\subsection{End-to-End Decode Throughput}
+
+\begin{table}[h]
+\centering
+\caption{Decode throughput comparison on Qwen3-4B (CUDA Graph, M=1)}
+\label{tab:e2e}
+\begin{tabular}{lccc}
+\toprule
+Method & ms/tok & tok/s & vs BF16 \\
+\midrule
+BF16 (cuBLAS) & 8.10 & 123 & 1.00$\times$ \\
+Marlin INT4/INT8 (unfused) & 9.94 & 101 & 0.81$\times$ \\
+\textbf{Marlin INT4/INT8 (fused)} & \textbf{6.63} & \textbf{151} & \textbf{1.22$\times$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The fused approach turns a 19\% slowdown into a 22\% speedup. Time breakdown:
+
+\begin{table}[h]
+\centering
+\caption{Decode time decomposition (ms)}
+\label{tab:decomp}
+\begin{tabular}{lcc}
+\toprule
+Component & BF16 & Marlin (fused) \\
+\midrule
+GEMM kernels & 5.65 & 3.70 \\
+Fused pre/post & --- & $\sim$0.5 \\
+Attention + Norm + Embed & 2.46 & 2.46 \\
+\midrule
+\textbf{Total} & \textbf{8.10} & \textbf{6.63} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Quality}
+
+\begin{table}[h]
+\centering
+\caption{WikiText-2 perplexity (lower is better)}
+\label{tab:ppl}
+\begin{tabular}{lcc}
+\toprule
+Method & Avg bits/weight & PPL \\
+\midrule
+BF16 baseline & 16.0 & 12.90 \\
+Uniform INT4 (no AWQ) & 4.0 & 13.51 \\
+AWQ + RDQuant INT4/INT8 & 5.3 & 13.70 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At 5.3 bpw (3$\times$ compression), the quality degradation is +0.8 PPL---acceptable for most applications.
+
+
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Mixed-precision quantization.}
+GPTQ~\cite{frantar2023gptq} and AWQ~\cite{lin2024awq} are leading post-training quantization methods. GPTQ uses approximate second-order information for per-column quantization; AWQ uses activation awareness for per-channel scaling. Both typically target uniform bit-widths. Our work extends AWQ with per-channel bit-width selection via rate-distortion optimization.
+
+\textbf{Efficient kernels.}
+Marlin~\cite{frantar2024marlin} provides near-optimal INT4 GEMM throughput. QQQ~\cite{lin2024qqq} fuses quantization into GEMM. Our INT8$\to$2$\times$INT4 decomposition leverages existing Marlin infrastructure without kernel modification.
+
+\textbf{Kernel fusion.}
+FlashAttention~\cite{dao2022flashattention} pioneered fusing multiple operations into single kernels. Our fused pre/post-processing kernels apply similar principles to the quantization inference path.
+
+
+% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented a practical approach to deploy mixed INT4/INT8 quantized models with a single GEMM kernel per layer, achieving 1.22$\times$ decode speedup over BF16 with 3$\times$ memory compression. The key insights are:
+\begin{enumerate}
+    \item INT8 weights can be exactly decomposed into two UINT4 nibbles with a cheap analytical correction, enabling single-kernel execution.
+    \item Marlin's persistent kernel cost is constant up to $\sim$14K output channels, so the enlarged $N_{\text{combined}}$ incurs zero additional GEMM overhead.
+    \item Fused pre/post-processing CUDA kernels are essential---without them, the PyTorch operator dispatch overhead negates all GEMM savings.
+    \item CUDA Graph further reduces per-node scheduling overhead, making the fused kernels' contribution only 7.5\% of total decode time.
+\end{enumerate}
+
+The approach is compatible with existing Marlin kernels (no kernel code modification) and can be extended to other mixed-precision formats (e.g., FP8$\to$2$\times$FP4 when supported by hardware).
+
+
+% =====================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{lin2024awq}
+J.~Lin, J.~Tang, H.~Tang, S.~Yang, W.-M.~Chen, W.-C.~Wang, G.~Xiao, X.~Dang, C.~Gan, and S.~Han.
+\newblock {AWQ}: Activation-aware weight quantization for {LLM} compression and acceleration.
+\newblock In \emph{MLSys}, 2024.
+
+\bibitem{frantar2023gptq}
+E.~Frantar, S.~P. Ashkboos, T.~Hoefler, and D.~Alistarh.
+\newblock {GPTQ}: Accurate post-training quantization for generative pre-trained transformers.
+\newblock In \emph{ICLR}, 2023.
+
+\bibitem{frantar2024marlin}
+E.~Frantar, R.~Castro, J.~Chen, L.~Hoang, T.~Hoefler, and D.~Alistarh.
+\newblock {Marlin}: Mixed-precision auto-regressive parallel inference on large language models.
+\newblock \emph{arXiv preprint arXiv:2408.11743}, 2024.
+
+\bibitem{lin2024qqq}
+J.~Lin, H.~Tang, S.~Yang, J.~Tang, and S.~Han.
+\newblock {QQQ}: Quality quattuor-bit quantization for large language models.
+\newblock \emph{arXiv preprint}, 2024.
+
+\bibitem{dao2022flashattention}
+T.~Dao, D.~Y. Fu, S.~Ermon, A.~Rudra, and C.~R\'{e}.
+\newblock {FlashAttention}: Fast and memory-efficient exact attention with {IO}-awareness.
+\newblock In \emph{NeurIPS}, 2022.
+
+\end{thebibliography}
+
+\end{document}

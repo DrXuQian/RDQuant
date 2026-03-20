@@ -180,6 +180,12 @@ class Int4FusedLinear(torch.nn.Module):
         # Store packed combined weight for future Marlin integration
         self.register_buffer('w_combined_uint4', w_combined)
 
+        # Store raw quantized weights and scales for Marlin conversion
+        self.register_buffer('w_int4_raw', w_int4)       # [N_int4, K] int8
+        self.register_buffer('s_int4_raw', s_int4)        # [N_int4, K//gs] float32
+        self.register_buffer('w_int8_raw', w_int8)        # [N_int8, K] int8
+        self.register_buffer('s_int8_raw', s_int8)        # [N_int8] float32
+
         # Store AWQ scales for use in forward pass
         if awq_scales is not None:
             self.register_buffer('awq_scales', awq_scales.float())
@@ -192,10 +198,8 @@ class Int4FusedLinear(torch.nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Fake-quant forward (dequant + F.linear per group, then combine).
-
-        TODO: Replace with single Marlin INT4 kernel + post-process.
-        """
+        """Fake-quant forward (dequant + F.linear per group, then combine)."""
+        orig_dtype = x.dtype
         orig_shape = x.shape
         # Match input dtype to stored weight dtype
         w_dtype = self.w_int4_deq.dtype if self.N_int4 > 0 else self.w_int8_deq.dtype
@@ -212,9 +216,9 @@ class Int4FusedLinear(torch.nn.Module):
         y = y.index_select(-1, self.inv_perm)
 
         if self.bias is not None:
-            y = y + self.bias
+            y = y + self.bias.to(y.dtype)
 
-        return y.reshape(*orig_shape[:-1], y.shape[-1])
+        return y.to(orig_dtype).reshape(*orig_shape[:-1], y.shape[-1])
 
     def forward_fused(self, x: torch.Tensor) -> torch.Tensor:
         """Fused forward using INT8→2×INT4 decomposition.
