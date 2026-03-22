@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 
 import pytest
 import torch
+import torch.nn as nn
+from safetensors.torch import save_file
+from transformers import PreTrainedModel
 
 from rdquant.fused_gemv_pack import (
     fused_gemv_available,
@@ -14,7 +19,27 @@ from rdquant.fused_gemv_pack import (
     pack_for_fused_gemv,
     build_marlin_data,
 )
-from rdquant.inference import FusedMixedLinear, _check_vllm
+from rdquant.inference import FusedMixedLinear, _check_vllm, load_for_inference
+
+
+class _DummyConfig:
+    model_type = "bert"
+
+
+class _DummyHFModel(PreTrainedModel):
+    config_class = _DummyConfig
+    base_model_prefix = ""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.fc = nn.Linear(256, 128, bias=True)
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(config)
+
+    def forward(self, x):
+        return self.fc(x)
 
 
 def _make_valid_layer_data(n_fp4: int, n_fp8: int, k: int) -> dict[str, torch.Tensor]:
@@ -32,6 +57,36 @@ def _make_valid_layer_data(n_fp4: int, n_fp8: int, k: int) -> dict[str, torch.Te
         "weight_fp8_scale": torch.rand(n_fp8, device="cpu", dtype=torch.float32) + 0.1,
         "inv_permutation": torch.randperm(n_fp4 + n_fp8, dtype=torch.int32),
     }
+
+
+def _write_dummy_checkpoint(tmpdir: str, layer_data: dict[str, torch.Tensor]) -> None:
+    save_file(
+        {
+            f"fc.{name}": tensor.contiguous().cpu()
+            for name, tensor in layer_data.items()
+        },
+        f"{tmpdir}/model.safetensors",
+    )
+    with open(f"{tmpdir}/quantization_config.json", "w") as f:
+        json.dump(
+            {
+                "quant_method": "rdquant",
+                "formats": ["NVFP4", "FP8", "FP16"],
+                "budget_avg_bits": 5.0,
+                "format_order": ["NVFP4", "FP8", "FP16"],
+                "layers": {
+                    "fc": {
+                        "in_features": 256,
+                        "out_features": 128,
+                        "splits": {"NVFP4": 64, "FP8": 64, "FP16": 0},
+                        "avg_bits": 6.0,
+                    }
+                },
+            },
+            f,
+        )
+    with open(f"{tmpdir}/config.json", "w") as f:
+        json.dump({"model_type": "bert"}, f)
 
 
 def test_make_marlin_group_maps_shapes():
@@ -133,3 +188,39 @@ def test_fused_mixed_linear_prefill_matches_marlin_fallback():
     y = mod(x)
     y_ref = mod._forward_marlin(x)
     assert torch.equal(y, y_ref)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _check_vllm() or not fused_gemv_available(),
+    reason="requires CUDA + vLLM + rdquant CUDA extension",
+)
+def test_load_for_inference_replaces_layer_with_fused_module():
+    device = "cuda"
+    layer_data = _make_valid_layer_data(64, 64, 256)
+    layer_data["bias"] = torch.randn(128, dtype=torch.float16)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_dummy_checkpoint(tmpdir, layer_data)
+        model = load_for_inference(
+            tmpdir,
+            model_class=_DummyHFModel,
+            device=device,
+            use_marlin=True,
+            use_fused_gemv=True,
+        )
+
+    assert isinstance(model.fc, FusedMixedLinear)
+    assert model.fc._has_marlin
+    assert model.fc._has_fused
+
+    x_decode = torch.randn(1, 256, device=device, dtype=torch.float16)
+    x_prefill = torch.randn(2, 256, device=device, dtype=torch.float16)
+
+    y_decode = model(x_decode)
+    y_prefill = model(x_prefill)
+
+    y_decode_ref = model.fc._forward_fused_gemv(x_decode)
+    y_prefill_ref = model.fc._forward_marlin(x_prefill)
+
+    assert torch.equal(y_decode, y_decode_ref + model.fc.bias)
+    assert torch.equal(y_prefill, y_prefill_ref + model.fc.bias)
