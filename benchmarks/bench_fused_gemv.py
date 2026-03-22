@@ -518,7 +518,13 @@ def test_correctness():
     print(f"  Split-K-S4 rel. err: {splitk_staged_mean_err / (ref_norm + 1e-8):.4%}")
     print(f"  Split-K-Auto rel.err:{splitk_auto_mean_err / (ref_norm + 1e-8):.4%}")
     print(f"  2xMarlin rel. error: {marlin_mean_err / (ref_norm + 1e-8):.4%}")
-    ok = max(max_err, splitk_max_err, splitk_staged_max_err, splitk_auto_max_err, marlin_max_err) < 0.5
+    ok = max(
+        max_err,
+        splitk_max_err,
+        splitk_staged_max_err,
+        splitk_auto_max_err,
+        marlin_max_err,
+    ) < 0.5
     print(f"  Status: {'PASS' if ok else 'FAIL'}")
     print()
     return ok
@@ -531,7 +537,8 @@ def bench_shapes(parallel_k_mode, warmup, repeat, sweep_warmup, sweep_repeat):
     print("=" * 60)
     print(f"{'Layer':<14} {'N':>6} {'K':>6} {'N4':>5} {'N8':>5} "
           f"{'cuBLAS':>8} {'Mrl4':>8} {'Mrl8':>8} {'M4+8':>8} {'2xMrl':>8} "
-          f"{'Base':>8} {'SplitK':>8} {'SK16':>8} {'SK32':>8} {'Split4S':>8} {'AutoSK':>8} {'BestSK':>8} {'P_K':>5} {'Mode':>8}")
+          f"{'Base':>8} {'SplitK':>8} {'SK16':>8} {'SK32':>8} {'Split4S':>8} "
+          f"{'AutoSK':>8} {'BestSK':>8} {'P_K':>5} {'Mode':>8}")
     print("-" * 194)
 
     fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps()

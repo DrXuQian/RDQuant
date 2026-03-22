@@ -81,6 +81,10 @@ static __constant__ float c_fp4_lut[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
+static __constant__ uint16_t c_fp4_half_raw[16] = {
+    0x0000, 0x3800, 0x3c00, 0x3e00, 0x4000, 0x4200, 0x4400, 0x4600,
+    0x8000, 0xb800, 0xbc00, 0xbe00, 0xc000, 0xc200, 0xc400, 0xc600};
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 __device__ __forceinline__ void cp_async4(void* smem_ptr, const void* glob_ptr) {
   reinterpret_cast<int4*>(smem_ptr)[0] =
@@ -262,17 +266,23 @@ __device__ __forceinline__ float run_fp8_tile(
 
 __device__ __forceinline__ void load_nvfp4_scalar_register_stage(
     const int32_t* __restrict__ row_ptr,
-    int32_t* __restrict__ packed_stage);
+    const half* __restrict__ x_tile,
+    int kk,
+    int32_t* __restrict__ packed_stage,
+    half2* __restrict__ x01_stage,
+    half2* __restrict__ x89_stage);
 
 __device__ __forceinline__ float consume_nvfp4_scalar_register_stage(
     const int32_t* __restrict__ packed_stage,
-    float scale,
-    const half* __restrict__ x_tile,
-    int kk,
+    half2 scale_h2,
+    const half2* __restrict__ x01_stage,
+    const half2* __restrict__ x89_stage,
     int shift_lo_01,
     int shift_hi_01,
     int shift_lo_89,
     int shift_hi_89);
+
+__device__ __forceinline__ float sum_half2(half2 x);
 
 __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
     const int32_t* __restrict__ w_fp4_q,
@@ -298,10 +308,15 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
       (k0 / 16) * fp4_row_stride + n_tile * 128 + fp4_word_offset(n_in_tile, 0);
   const int32_t* __restrict__ row_ptr = w_fp4_q + qweight_base;
   int32_t packed_regs[kNvfp4RegisterStages][4];
+  half2 x01_regs[kNvfp4RegisterStages][4];
+  half2 x89_regs[kNvfp4RegisterStages][4];
 
-  load_nvfp4_scalar_register_stage(row_ptr, packed_regs[0]);
+  load_nvfp4_scalar_register_stage(
+      row_ptr, x_tile, 0, packed_regs[0], x01_regs[0], x89_regs[0]);
   if constexpr (kQweightTileKChunks > 1) {
-    load_nvfp4_scalar_register_stage(row_ptr + fp4_row_stride, packed_regs[1]);
+    load_nvfp4_scalar_register_stage(
+        row_ptr + fp4_row_stride, x_tile, 16,
+        packed_regs[1], x01_regs[1], x89_regs[1]);
   }
 
   #pragma unroll
@@ -312,17 +327,18 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
     const float scale =
         fp8_e4m3_to_float((scale_word >> scale_shift) & 0xFF) *
         w_fp4_global_scale;
+    const half2 scale_h2 = __float2half2_rn(scale);
     const int pipe = kk_block % kNvfp4RegisterStages;
-    const int kk = kk_block * 16;
 
     acc += consume_nvfp4_scalar_register_stage(
-        packed_regs[pipe], scale, x_tile, kk,
+        packed_regs[pipe], scale_h2, x01_regs[pipe], x89_regs[pipe],
         shift_lo_01, shift_hi_01, shift_lo_89, shift_hi_89);
 
     const int next_block = kk_block + kNvfp4RegisterStages;
     if (next_block < kQweightTileKChunks) {
       load_nvfp4_scalar_register_stage(
-          row_ptr + next_block * fp4_row_stride, packed_regs[pipe]);
+          row_ptr + next_block * fp4_row_stride, x_tile, next_block * 16,
+          packed_regs[pipe], x01_regs[pipe], x89_regs[pipe]);
     }
   }
 
@@ -369,18 +385,26 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_staged(
 
 __device__ __forceinline__ void load_nvfp4_scalar_register_stage(
     const int32_t* __restrict__ row_ptr,
-    int32_t* __restrict__ packed_stage) {
+    const half* __restrict__ x_tile,
+    int kk,
+    int32_t* __restrict__ packed_stage,
+    half2* __restrict__ x01_stage,
+    half2* __restrict__ x89_stage) {
   #pragma unroll
   for (int group = 0; group < 4; ++group) {
     packed_stage[group] = row_ptr[group * 4];
+    const int sub = group * 2;
+    x01_stage[group] = __halves2half2(x_tile[kk + sub], x_tile[kk + sub + 1]);
+    x89_stage[group] =
+        __halves2half2(x_tile[kk + sub + 8], x_tile[kk + sub + 9]);
   }
 }
 
 __device__ __forceinline__ float consume_nvfp4_scalar_register_stage(
     const int32_t* __restrict__ packed_stage,
-    float scale,
-    const half* __restrict__ x_tile,
-    int kk,
+    half2 scale_h2,
+    const half2* __restrict__ x01_stage,
+    const half2* __restrict__ x89_stage,
     int shift_lo_01,
     int shift_hi_01,
     int shift_lo_89,
@@ -390,15 +414,20 @@ __device__ __forceinline__ float consume_nvfp4_scalar_register_stage(
   #pragma unroll
   for (int group = 0; group < 4; ++group) {
     const int packed = packed_stage[group];
-    const int sub = group * 2;
-    acc += c_fp4_lut[(packed >> shift_lo_01) & 0xF] *
-           scale * __half2float(x_tile[kk + sub]);
-    acc += c_fp4_lut[(packed >> shift_hi_01) & 0xF] *
-           scale * __half2float(x_tile[kk + sub + 1]);
-    acc += c_fp4_lut[(packed >> shift_lo_89) & 0xF] *
-           scale * __half2float(x_tile[kk + sub + 8]);
-    acc += c_fp4_lut[(packed >> shift_hi_89) & 0xF] *
-           scale * __half2float(x_tile[kk + sub + 9]);
+    const int idx01 = ((packed >> shift_lo_01) & 0xF) |
+                      (((packed >> shift_hi_01) & 0xF) << 4);
+    const int idx89 = ((packed >> shift_lo_89) & 0xF) |
+                      (((packed >> shift_hi_89) & 0xF) << 4);
+    const uint32_t raw01 = static_cast<uint32_t>(c_fp4_half_raw[idx01 & 0xF]) |
+                           (static_cast<uint32_t>(c_fp4_half_raw[idx01 >> 4]) << 16);
+    const uint32_t raw89 = static_cast<uint32_t>(c_fp4_half_raw[idx89 & 0xF]) |
+                           (static_cast<uint32_t>(c_fp4_half_raw[idx89 >> 4]) << 16);
+    const half2 frag01 = __hmul2(
+        *reinterpret_cast<const half2*>(&raw01), scale_h2);
+    const half2 frag89 = __hmul2(
+        *reinterpret_cast<const half2*>(&raw89), scale_h2);
+    acc += sum_half2(__hmul2(frag01, x01_stage[group]));
+    acc += sum_half2(__hmul2(frag89, x89_stage[group]));
   }
 
   return acc;
@@ -1509,6 +1538,7 @@ void fused_mixed_gemv_marlin_weights_splitk_staged_nvfp4(
       k,
       parallel_k);
 }
+
 
 void fused_mixed_gemv_marlin_weights_splitk_auto(
     const void* x,
