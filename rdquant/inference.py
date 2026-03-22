@@ -343,6 +343,9 @@ class FusedMixedLinear(nn.Module):
 
         self._has_marlin = marlin_data is not None
         self._has_fused = fused_data is not None
+        self._fused_lane_override = os.environ.get(
+            "RDQ_FUSED_LANE_OVERRIDE", ""
+        ).strip().lower()
 
         if marlin_data is not None:
             for name, tensor in marlin_data.items():
@@ -432,6 +435,13 @@ class FusedMixedLinear(nn.Module):
         """
         can_n4m = self._should_use_nvfp4_marlin_fused_lane()
         can_f8m = self._should_use_fp8_marlin_fused_lane()
+
+        if self._fused_lane_override in {"auto", "legacy"}:
+            return "auto"
+        if self._fused_lane_override == "n4m":
+            return "n4m" if can_n4m else "auto"
+        if self._fused_lane_override == "f8m":
+            return "f8m" if can_f8m else "auto"
 
         if not can_n4m and not can_f8m:
             return "auto"
