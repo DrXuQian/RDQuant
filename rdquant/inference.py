@@ -400,7 +400,7 @@ class FusedMixedLinear(nn.Module):
         return self._has_fused and x_2d.is_cuda and x_2d.size(0) == 1
 
     def _should_use_nvfp4_marlin_fused_lane(self) -> bool:
-        return self._has_fused_nvfp4_marlin and self.n_nvfp4 >= 512
+        return self._has_fused_nvfp4_marlin and self.n_nvfp4 >= 256
 
     def _forward_fused_gemv(self, x_half: torch.Tensor) -> torch.Tensor:
         rdquant_cuda = get_rdquant_cuda()
