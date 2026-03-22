@@ -211,6 +211,25 @@ __device__ __forceinline__ int fp4_slot_base(int n_in_tile) {
   }
 }
 
+[[maybe_unused]] __device__ __forceinline__ void
+stage_fp4_processed_scales_k_tile_marlin_nvfp4(
+    const int4* __restrict__ w_fp4_scales,
+    int4* __restrict__ sh_scales,
+    int tile_base,
+    int k0,
+    int fp4_scale_row_stride) {
+  const int tile_scale_base = tile_base / 16;
+
+  for (int idx = threadIdx.x; idx < MarlinNvfp4Tile::kSShStage;
+       idx += blockDim.x) {
+    const int kk_block = idx / MarlinNvfp4Tile::kSShStride;
+    const int local_vec = idx % MarlinNvfp4Tile::kSShStride;
+    sh_scales[idx] =
+        w_fp4_scales[((k0 / 16) + kk_block) * fp4_scale_row_stride +
+                     tile_scale_base + local_vec];
+  }
+}
+
 __device__ __forceinline__ void dequant_fp8_word_to_half2_pairs(
     int q, half2* frag_b) {
   constexpr int kFp8Exponent = 4;

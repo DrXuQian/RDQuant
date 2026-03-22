@@ -61,6 +61,10 @@ struct Tile128x128x128 {
   __device__ static inline int s_sh_rd(int lane) {
     return kSShStride * ((lane / 32) % kTbNWarps) + ((lane % 32) / 4);
   }
+
+  __device__ static inline int s_sh_rd_pair(int lane, int k_step) {
+    return s_sh_rd(lane) + scale_group(lane, k_step) * (2 * kSShStride);
+  }
 };
 
 template <int count>
@@ -119,6 +123,18 @@ __device__ inline int load_qweight_int_tile128(
   const int* sh_b_int = reinterpret_cast<const int*>(sh_b);
   return sh_b_int[Tile128x128x128::kBShStride * (k_step % Tile128x128x128::kBShWrIters) +
                   Tile128x128x128::b_sh_rd(lane) + j];
+}
+
+__device__ inline void load_scale_frags_tile128(
+    const int4* sh_s, int lane, int k_step, FragS* frag_s) {
+  const int2 raw_pair =
+      reinterpret_cast<const int2*>(sh_s)[Tile128x128x128::s_sh_rd_pair(lane, k_step)];
+  reinterpret_cast<int2*>(frag_s)[0] = raw_pair;
+
+  const int s_quant_0 = reinterpret_cast<int*>(frag_s)[0];
+  const int s_quant_1 = reinterpret_cast<int*>(frag_s)[1];
+  dequant_nvfp4_scales(s_quant_0, reinterpret_cast<half2*>(frag_s));
+  dequant_nvfp4_scales(s_quant_1, reinterpret_cast<half2*>(frag_s) + 2);
 }
 
 }  // namespace rdquant_marlin_nvfp4
