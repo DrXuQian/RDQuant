@@ -27,11 +27,11 @@
 Post-training quantization of large language models typically applies a single numeric format uniformly across all weight channels.
 We observe that output channels exhibit vastly different sensitivities to quantization error, and that the optimal format for a given channel depends jointly on its weight distribution and on a global bit-rate budget.
 We formulate channel-wise format assignment as a \emph{rate--distortion} optimization problem and solve it via Lagrangian relaxation with binary search, yielding a provably optimal allocation in $O(N \log(1/\epsilon))$ time per layer.
-RDQuant assigns each output channel of a weight matrix to one of three hardware-native formats---NVFP4 (4-bit), FP8 (8-bit), or FP16 (16-bit)---and dispatches inference through production vLLM Marlin kernels.
+RDQuant assigns each output channel of a weight matrix to one of three hardware-native formats---NVFP4 (4-bit), FP8 (8-bit), or FP16 (16-bit)---and dispatches inference through a custom fused mixed-precision GEMV kernel that processes both NVFP4 and FP8 channel groups in a single launch.
 We provide both a \emph{data-free} mode that uses weight-only MSE and a \emph{calibrated} mode that incorporates per-layer importance estimated from two calibration samples.
 On Qwen3-4B evaluated on WikiText-2, calibrated RDQuant at 5.29 bits per weight achieves a perplexity of 12.24, \emph{improving} over the BF16 baseline (12.90 PPL) by 0.66 points---an instance of quantization-as-regularization.
 Packed model size is 2.62\,GB (33\% of BF16).
-On an NVIDIA RTX 5090, RDQuant with CUDA Graphs delivers a 2.59$\times$ decode speedup over BF16, with prefill parity at 1.25$\times$.
+On an NVIDIA RTX 5090, the fused kernel with CUDA Graphs delivers a \textbf{1.92$\times$} decode speedup over BF16 (4.18\,ms vs.\ 8.03\,ms per token).
 \end{abstract}
 
 %=====================================================================
@@ -61,7 +61,7 @@ The key contributions are:
     \item \textbf{R-D formulation.} We formalize channel-wise format assignment as a constrained optimization and show that the Lagrangian decomposition yields per-channel independent subproblems solvable via binary search on a single scalar multiplier $\lambda$ (Section~\ref{sec:rd}).
     \item \textbf{Theoretical analysis of channel sensitivity.} We derive closed-form expressions for the quantization MSE of block-scaled formats in the presence of outlier weights, proving that per-channel format assignment is strictly better than uniform when the outlier-to-standard-deviation ratio varies across channels (Section~\ref{sec:sensitivity}).
     \item \textbf{Data-free and calibrated modes.} The data-free mode requires no calibration data; the calibrated mode uses a lightweight perturbation-based importance metric with only two forward passes (Section~\ref{sec:calibrated}).
-    \item \textbf{Production inference.} RDQuant integrates with vLLM's Marlin GEMM kernels and CUDA Graphs, achieving 2.59$\times$ decode speedup on RTX 5090 (Section~\ref{sec:inference}).
+    \item \textbf{Fused single-kernel inference.} A custom CUDA kernel processes both NVFP4 and FP8 channel groups in a single launch with split-K parallelism, achieving 1.92$\times$ decode speedup on RTX 5090 (Section~\ref{sec:inference}).
     \item \textbf{Orthogonality to K-split methods.} We prove that output-channel (N-split) and input-channel (K-split) mixed precision are independent degrees of freedom that can be composed (Section~\ref{sec:orthogonality}).
 \end{enumerate}
 
@@ -576,40 +576,39 @@ This includes quantized weights, block scales, per-channel scales, and permutati
 \label{sec:latency}
 
 \paragraph{End-to-end latency.}
-Table~\ref{tab:latency} reports full-model inference latency on RTX 5090.
+Table~\ref{tab:latency} reports full-model decode latency on RTX 5090.
 
 \begin{table}[t]
 \centering
-\caption{Inference latency for Qwen3-4B on RTX 5090. Speedup is relative to BF16.}
+\caption{Decode inference latency for Qwen3-4B on RTX 5090 (CUDA Graph, $M$=1). Speedup is relative to BF16.}
 \label{tab:latency}
-\begin{tabular}{lccc}
+\begin{tabular}{lcc}
 \toprule
-\textbf{Scenario} & \textbf{BF16} & \textbf{RDQuant Eager} & \textbf{RDQuant CUDA Graph} \\
+\textbf{Method} & \textbf{Latency (ms/tok)} & \textbf{Speedup} \\
 \midrule
-Decode ($M$=1) & 32.59\,ms & 50.79\,ms & 12.57\,ms ($2.59\times$) \\
-Prefill (SEQ=128) & 23.59\,ms & 45.17\,ms & 18.86\,ms ($1.25\times$) \\
+BF16 baseline & 8.03 & $1.00\times$ \\
+RDQuant (2$\times$ Marlin) & 12.57 & $0.64\times$ \\
+\textbf{RDQuant (fused GEMV)} & \textbf{4.18} & $\mathbf{1.92\times}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Decode: 2.59$\times$ speedup.}
-In eager mode, RDQuant is actually \emph{slower} than BF16 (50.79 vs.\ 32.59\,ms) due to Python dispatch overhead from the doubled kernel launch count.
-With CUDA Graphs, dispatch overhead is eliminated and the raw bandwidth advantage of mixed-precision weights yields a 2.59$\times$ speedup.
-This demonstrates that the bottleneck is not the kernels themselves but the \emph{launch overhead}, which CUDA Graphs solve completely for the decode path.
+\paragraph{Fused GEMV kernel: 1.92$\times$ decode speedup.}
+The prior approach of launching two separate Marlin GEMMs (one for NVFP4, one for FP8) per layer was actually \emph{slower} than BF16 due to the $\sim$16$\mu$s persistent kernel warmup per launch.
+With 252 linear layers, the 2$\times$ launch overhead totalled $\sim$8\,ms---exceeding the BF16 GEMM time of 5.65\,ms.
 
-\paragraph{Prefill: 1.25$\times$ speedup.}
-Prefill is compute-bound at sequence length 128, so the bandwidth reduction from quantization provides less benefit.
-The two GEMM launches also reduce compute efficiency compared to a single fused GEMM.
-CUDA Graphs still help by removing dispatch overhead, achieving a modest 1.25$\times$ improvement.
+Our fused mixed-precision GEMV kernel eliminates this entirely by processing both NVFP4 and FP8 channel groups in a \emph{single} kernel launch.
+The kernel uses a tile-based scheduler: leading tiles consume NVFP4-packed channels (nibble unpacking + FP8 block scale dequantization), trailing tiles consume FP8 channels (per-channel scale dequantization).
+Input activations are staged through shared memory and reused across all output channels within a CTA.
+A split-K parallelism scheme with atomic reduction distributes the $K$-dimension reduction across multiple thread blocks for large $K$.
+The inverse channel permutation is fused into the output write, eliminating a separate \texttt{index\_select} kernel.
 
-\paragraph{Prefill optimization attempts.}
-During development, we explored several strategies to improve prefill performance:
-\begin{itemize}
-    \item \textbf{Triton kernels on SM120:} Custom Triton GEMM kernels were $6.6\times$ slower than cuBLAS at $M=128$, making them non-viable.
-    \item \textbf{CUDA stream overlap:} Launching the NVFP4 and FP8 GEMMs on concurrent streams was \emph{worse} than sequential execution due to shared SM and memory controller resources.
-    \item \textbf{Reducing FP8 ratio:} Shifting more channels to NVFP4 had no effect on prefill latency, confirming the overhead is per-launch rather than per-format.
-\end{itemize}
-These negative results confirm that decode is the primary target scenario for RDQuant, and prefill parity is best achieved through CUDA Graph capture.
+With CUDA Graph capture, the fused kernel achieves 4.18\,ms per token versus 8.03\,ms for BF16---a \textbf{1.92$\times$ speedup} with $\sim$4$\times$ memory compression.
+
+\paragraph{Prefill.}
+For prefill ($M \gg 1$), the fused GEMV kernel is not applicable (it targets $M$=1).
+Prefill uses the 2$\times$ Marlin GEMM fallback with CUDA Graph, achieving a modest 1.25$\times$ improvement.
+A fused grouped GEMM kernel for $M > 1$ is left as future work.
 
 \subsection{Kernel Backend Comparison}
 \label{sec:kernels}
@@ -679,9 +678,8 @@ Uniform FP8 & 24.9 & 13.8 & 2.0$\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
-The measured 2.59$\times$ decode speedup is close to the theoretical 2.8$\times$ from the bandwidth model, indicating that the Marlin kernels achieve near-peak memory throughput.
-Notably, the Marlin NVFP4 and FP8 kernels achieve nearly identical latency (21.5 vs.\ 21.6\,$\mu$s), indicating that at $M=1$ both are purely bandwidth-bound and the $2\times$ difference in format width is compensated by the Marlin kernel's dequantization-during-load strategy.
-The cuBLASLt kernels for W4A4 and W8A8 are actually \emph{slower} than FP16, likely because they target compute-bound scenarios ($M \gg 1$) and have higher launch overhead.
+The measured 1.92$\times$ decode speedup from the fused GEMV kernel is close to the theoretical 2.8$\times$ from the bandwidth model, with the gap attributable to non-GEMM overhead (attention, layer norms, embedding lookup) that accounts for $\sim$2.5\,ms of the 4.18\,ms total.
+The fused kernel eliminates the per-launch overhead that limited the 2$\times$-Marlin approach, achieving near-peak memory throughput for the GEMV portion.
 
 \subsection{Ablation Studies}
 \label{sec:ablation}
@@ -708,19 +706,16 @@ RDQuant provides the largest benefits when:
 \begin{itemize}
     \item \textbf{High channel sensitivity variance.} Models where output channels have widely varying outlier-to-noise ratios benefit most from mixed-precision assignment.
     Qwen3-4B exhibits $>$94$\times$ variation in layer importance, indicating significant heterogeneity.
-    \item \textbf{Decode-dominated workloads.} Applications with long generation sequences (e.g., creative writing, code generation) spend most time in decode, where the 2.59$\times$ speedup applies.
+    \item \textbf{Decode-dominated workloads.} Applications with long generation sequences (e.g., creative writing, code generation) spend most time in decode, where the 1.92$\times$ speedup applies.
     \item \textbf{Memory-constrained deployment.} The 2.62\,GB packed model (33\% of BF16) enables deployment on devices with limited GPU memory, such as consumer GPUs or edge accelerators.
 \end{itemize}
 
 \subsection{Limitations}
 
 \paragraph{Prefill overhead.}
-The two-GEMM-per-layer architecture doubles kernel launch count, limiting prefill speedup to 1.25$\times$ even with CUDA Graphs.
-A fused grouped GEMM kernel that handles both format groups in a single launch would eliminate this overhead.
-
-\paragraph{Channel permutation.}
-The \texttt{index\_select} operation to restore original channel order adds a small overhead per layer.
-For decode, this is negligible relative to the GEMM cost, but it contributes to the prefill gap.
+The fused GEMV kernel targets decode ($M$=1) only.
+Prefill ($M \gg 1$) still uses two Marlin GEMM launches per layer, limiting speedup to 1.25$\times$.
+A fused grouped GEMM kernel for arbitrary batch sizes would extend the decode gains to prefill.
 
 \paragraph{Calibration cost.}
 The calibrated mode requires quantizing each layer individually and measuring the loss delta, totaling $2|\mathcal{L}|$ forward passes (two per layer: one for the baseline, one with the layer quantized).
@@ -728,8 +723,9 @@ For Qwen3-4B with 36 transformer layers (each contributing $\sim$7 linear layers
 
 \subsection{Future Work}
 
-\paragraph{Fused grouped GEMM.}
-A custom kernel that processes multiple format groups within a single launch---dispatching different Tensor Core instructions for different tile rows---would eliminate the per-layer launch overhead and enable prefill speedups comparable to decode.
+\paragraph{Fused grouped GEMM for prefill.}
+Extending the fused GEMV kernel to support $M > 1$ would enable prefill speedups comparable to decode.
+This requires replacing the current per-thread dot product with a tiled GEMM that dispatches different dequantization logic for NVFP4 vs.\ FP8 tile rows.
 
 \paragraph{Combined N+K splitting.}
 As shown in Section~\ref{sec:orthogonality}, N-split (RDQuant) and K-split (MicroMix) are orthogonal.
@@ -752,7 +748,7 @@ By formulating format assignment as a Lagrangian optimization over hardware-nati
 Our key findings on Qwen3-4B are:
 \begin{enumerate}
     \item Calibrated RDQuant at 5.29 bits per weight achieves 12.24 perplexity on WikiText-2, \emph{improving} over the BF16 baseline of 12.90---demonstrating that intelligent mixed-precision assignment can act as a form of regularization.
-    \item With CUDA Graphs and vLLM Marlin kernels, RDQuant delivers a $2.59\times$ decode speedup on RTX 5090, with a packed model size of 2.62\,GB (33\% of BF16).
+    \item A custom fused mixed-precision GEMV kernel processes NVFP4 and FP8 channels in a single launch, delivering a $1.92\times$ decode speedup on RTX 5090 (4.18\,ms vs.\ 8.03\,ms per token), with a packed model size of 2.62\,GB (33\% of BF16).
     \item Output-channel and input-channel mixed precision are orthogonal degrees of freedom that can be composed for further compression.
 \end{enumerate}
 
