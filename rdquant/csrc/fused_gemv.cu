@@ -39,6 +39,13 @@ constexpr int kFp8MaxWordsPerChunk =
 constexpr int kFp4MaxScalesPerKTile = kBlockN * kQweightTileKChunks;
 constexpr int kFp8RegisterStages = 2;
 constexpr int kNvfp4RegisterStages = 2;
+using MarlinNvfp4Tile = rdquant_marlin_nvfp4::Tile128x128x128;
+
+struct [[maybe_unused]] MarlinNvfp4TileShared {
+  int4 a[MarlinNvfp4Tile::kAShStage];
+  int4 b[MarlinNvfp4Tile::kBShStage];
+  uint8_t scales[kBlockN * kQweightTileKChunks];
+};
 
 static_assert(kQweightTileKChunks % kFp8ChunkSubtiles == 0,
               "FP8 chunk staging expects an integer number of chunks per kBlockK");
@@ -152,6 +159,56 @@ __device__ __forceinline__ int fp8_word_offset(int n_in_tile, int group) {
 
 __device__ __forceinline__ int fp4_slot_base(int n_in_tile) {
   return ((n_in_tile >> 3) & 1) << 1;
+}
+
+[[maybe_unused]] __device__ __forceinline__ void stage_x_tile_marlin_nvfp4(
+    const half* __restrict__ x_tile, int4* __restrict__ sh_a) {
+  const int4* __restrict__ x_vec = reinterpret_cast<const int4*>(x_tile);
+
+  for (int idx = threadIdx.x; idx < MarlinNvfp4Tile::kAShStage;
+       idx += blockDim.x) {
+    const int row = idx / MarlinNvfp4Tile::kAShStride;
+    const int col = idx % MarlinNvfp4Tile::kAShStride;
+    (void)row;
+    sh_a[MarlinNvfp4Tile::transform_a(idx)] = x_vec[col];
+  }
+}
+
+[[maybe_unused]] __device__ __forceinline__ void stage_fp4_qweight_k_tile_marlin_nvfp4(
+    const int32_t* __restrict__ w_fp4_q,
+    int4* __restrict__ sh_b,
+    int tile_base,
+    int fp4_row_stride,
+    int k0) {
+  const int tile_word_base = (tile_base / 64) * kFp4WordsPerSubtile;
+  const int tile_int4_base = tile_word_base / 4;
+
+  for (int idx = threadIdx.x; idx < MarlinNvfp4Tile::kBShStage;
+       idx += blockDim.x) {
+    const int kk_block = idx / MarlinNvfp4Tile::kBShStride;
+    const int local_int4 = idx % MarlinNvfp4Tile::kBShStride;
+    sh_b[idx] = reinterpret_cast<const int4*>(
+        w_fp4_q + ((k0 / 16) + kk_block) * fp4_row_stride + tile_int4_base)[local_int4];
+  }
+}
+
+[[maybe_unused]] __device__ __forceinline__ void stage_fp4_scales_k_tile_marlin_nvfp4(
+    const uint8_t* __restrict__ w_fp4_scales,
+    uint8_t* __restrict__ sh_scales,
+    int tile_base,
+    int valid_channels,
+    int k,
+    int k0) {
+  const int scales_per_channel = k / 16;
+  const int total_scales = valid_channels * kQweightTileKChunks;
+
+  for (int idx = threadIdx.x; idx < total_scales; idx += blockDim.x) {
+    const int local_channel = idx / kQweightTileKChunks;
+    const int kk_block = idx % kQweightTileKChunks;
+    sh_scales[idx] =
+        w_fp4_scales[(tile_base + local_channel) * scales_per_channel +
+                     (k0 / 16) + kk_block];
+  }
 }
 
 __device__ __forceinline__ void dequant_fp8_word_to_half2_pairs(
