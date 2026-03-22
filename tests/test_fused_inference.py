@@ -112,7 +112,7 @@ def test_pack_for_fused_gemv_rejects_ineligible_shapes():
     not torch.cuda.is_available() or not _check_vllm() or not fused_gemv_available(),
     reason="requires CUDA + vLLM + rdquant CUDA extension",
 )
-def test_pack_for_fused_gemv_includes_processed_nvfp4_scales():
+def test_pack_for_fused_gemv_includes_processed_marlin_scales():
     layer_data = _make_valid_layer_data(64, 64, 256)
     splits = {"NVFP4": 64, "FP8": 64, "FP16": 0}
     fused_data = pack_for_fused_gemv(layer_data, splits, 256, "cuda")
@@ -120,8 +120,10 @@ def test_pack_for_fused_gemv_includes_processed_nvfp4_scales():
     assert fused_data is not None
     assert "w_fp4_scales_marlin" in fused_data
     assert "w_fp4_global_scale_marlin" in fused_data
+    assert "w_fp8_scales_marlin" in fused_data
     assert fused_data["w_fp4_scales_marlin"].is_cuda
     assert fused_data["w_fp4_global_scale_marlin"].is_cuda
+    assert fused_data["w_fp8_scales_marlin"].is_cuda
 
 
 @pytest.mark.skipif(
@@ -154,7 +156,8 @@ def test_fused_mixed_linear_decode_matches_direct_kernel():
 
     x = torch.randn(1, k, device=device, dtype=torch.float16)
     y_mod = mod(x)
-    if mod._should_use_nvfp4_marlin_fused_lane():
+    lane = mod._select_decode_fused_lane()
+    if lane == "n4m":
         y_direct = rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin(
             x,
             mod._fused_w_fp4_q,
@@ -162,6 +165,25 @@ def test_fused_mixed_linear_decode_matches_direct_kernel():
             mod._fused_w_fp4_global_scale_marlin,
             mod._fused_w_fp8_q,
             mod._fused_w_fp8_scales,
+            mod._fused_fp4_word_offsets,
+            mod._fused_fp4_slot_map,
+            mod._fused_fp8_word_offsets,
+            mod._inv_perm_i32,
+            mod._fused_workspace,
+            mod._fused_tile_counters,
+            n_fp4,
+            n_fp8,
+            k,
+            mod._fused_parallel_k,
+        )
+    elif lane == "f8m":
+        y_direct = rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_fp8_marlin(
+            x,
+            mod._fused_w_fp4_q,
+            mod._fused_w_fp4_scales_marlin,
+            mod._fused_w_fp4_global_scale_marlin,
+            mod._fused_w_fp8_q,
+            mod._fused_w_fp8_scales_marlin,
             mod._fused_fp4_word_offsets,
             mod._fused_fp4_slot_map,
             mod._fused_fp8_word_offsets,

@@ -362,6 +362,10 @@ class FusedMixedLinear(nn.Module):
                 )
             self.register_buffer("_fused_w_fp8_q", fused_data["w_fp8_q"])
             self.register_buffer("_fused_w_fp8_scales", fused_data["w_fp8_scales"])
+            if "w_fp8_scales_marlin" in fused_data:
+                self.register_buffer(
+                    "_fused_w_fp8_scales_marlin", fused_data["w_fp8_scales_marlin"]
+                )
             self.register_buffer(
                 "_fused_fp4_word_offsets", fused_data["fp4_word_offsets"]
             )
@@ -390,8 +394,19 @@ class FusedMixedLinear(nn.Module):
                     "fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin",
                 )
             )
+            self._has_fused_fp8_marlin = (
+                fused_data is not None
+                and hasattr(self, "_fused_w_fp4_scales_marlin")
+                and hasattr(self, "_fused_w_fp4_global_scale_marlin")
+                and hasattr(self, "_fused_w_fp8_scales_marlin")
+                and hasattr(
+                    rdquant_cuda,
+                    "fused_mixed_gemv_marlin_weights_splitk_fp8_marlin",
+                )
+            )
         except Exception:
             self._has_fused_nvfp4_marlin = False
+            self._has_fused_fp8_marlin = False
 
         if w_fp16_fp16 is not None:
             self.register_buffer("_fp16_weight", w_fp16_fp16.half())
@@ -402,9 +417,43 @@ class FusedMixedLinear(nn.Module):
     def _should_use_nvfp4_marlin_fused_lane(self) -> bool:
         return self._has_fused_nvfp4_marlin and self.n_nvfp4 >= 256
 
+    def _should_use_fp8_marlin_fused_lane(self) -> bool:
+        return self._has_fused_fp8_marlin and self.n_fp8 >= 128
+
+    def _select_decode_fused_lane(self) -> str:
+        """Return the decode kernel family to use for the current layer.
+
+        The thresholds are intentionally conservative and tuned to the current
+        Qwen3-4B layer shapes:
+
+        - very large mixed layers still favor the NVFP4 Marlin lane
+        - tiny FP8 tails favor the FP8 Marlin lane only at smaller K
+        - medium FP8-dominant / balanced shapes favor the FP8 Marlin lane
+        """
+        can_n4m = self._should_use_nvfp4_marlin_fused_lane()
+        can_f8m = self._should_use_fp8_marlin_fused_lane()
+
+        if not can_n4m and not can_f8m:
+            return "auto"
+        if can_n4m and not can_f8m:
+            return "n4m"
+        if can_f8m and not can_n4m:
+            return "f8m"
+
+        if self.n_nvfp4 >= 4096 or self.n_fp8 >= 4096:
+            return "n4m"
+        if self.n_fp8 <= 128:
+            return "f8m" if self.K <= 4096 else "n4m"
+        if self.n_nvfp4 <= 256:
+            return "n4m"
+        if self.n_fp8 >= self.n_nvfp4 or self.n_fp8 >= 384:
+            return "f8m"
+        return "n4m"
+
     def _forward_fused_gemv(self, x_half: torch.Tensor) -> torch.Tensor:
         rdquant_cuda = get_rdquant_cuda()
-        if self._should_use_nvfp4_marlin_fused_lane():
+        lane = self._select_decode_fused_lane()
+        if lane == "n4m":
             return rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin(
                 x_half,
                 self._fused_w_fp4_q,
@@ -412,6 +461,25 @@ class FusedMixedLinear(nn.Module):
                 self._fused_w_fp4_global_scale_marlin,
                 self._fused_w_fp8_q,
                 self._fused_w_fp8_scales,
+                self._fused_fp4_word_offsets,
+                self._fused_fp4_slot_map,
+                self._fused_fp8_word_offsets,
+                self._inv_perm_i32,
+                self._fused_workspace,
+                self._fused_tile_counters,
+                self.n_nvfp4,
+                self.n_fp8,
+                self.K,
+                self._fused_parallel_k,
+            )
+        if lane == "f8m":
+            return rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_fp8_marlin(
+                x_half,
+                self._fused_w_fp4_q,
+                self._fused_w_fp4_scales_marlin,
+                self._fused_w_fp4_global_scale_marlin,
+                self._fused_w_fp8_q,
+                self._fused_w_fp8_scales_marlin,
                 self._fused_fp4_word_offsets,
                 self._fused_fp4_slot_map,
                 self._fused_fp8_word_offsets,

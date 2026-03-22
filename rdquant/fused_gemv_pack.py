@@ -328,6 +328,11 @@ def pack_for_fused_gemv(
     fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps(device)
     n_total = n_fp4 + n_fp8
     num_tiles = (n_fp4 + 127) // 128 + (n_fp8 + 127) // 128
+    w_fp8_scales_marlin = prepare_marlin_fp8_scales(
+        layer_data["weight_fp8_scale"].to(device=device, dtype=torch.float32),
+        k,
+        n_fp8,
+    )
 
     return {
         "w_fp4_q": pack_fp4_to_marlin_qweight(w_fp4_packed),
@@ -339,6 +344,7 @@ def pack_for_fused_gemv(
         "w_fp8_scales": layer_data["weight_fp8_scale"].to(
             device=device, dtype=torch.float32
         ).contiguous(),
+        "w_fp8_scales_marlin": w_fp8_scales_marlin,
         "fp4_word_offsets": fp4_word_offsets,
         "fp4_slot_map": fp4_slot_map,
         "fp8_word_offsets": fp8_word_offsets,
