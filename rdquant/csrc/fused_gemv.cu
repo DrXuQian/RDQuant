@@ -36,6 +36,7 @@ constexpr int kFp8MaxWordsPerChunk =
     kFp8ChunkSubtiles * 2 * kFp8WordsPerSubtile;
 constexpr int kFp4MaxScalesPerKTile = kBlockN * kQweightTileKChunks;
 constexpr int kFp8RegisterStages = 2;
+constexpr int kNvfp4RegisterStages = 2;
 
 static_assert(kQweightTileKChunks % kFp8ChunkSubtiles == 0,
               "FP8 chunk staging expects an integer number of chunks per kBlockK");
@@ -259,6 +260,20 @@ __device__ __forceinline__ float run_fp8_tile(
   return acc;
 }
 
+__device__ __forceinline__ void load_nvfp4_scalar_register_stage(
+    const int32_t* __restrict__ row_ptr,
+    int32_t* __restrict__ packed_stage);
+
+__device__ __forceinline__ float consume_nvfp4_scalar_register_stage(
+    const int32_t* __restrict__ packed_stage,
+    float scale,
+    const half* __restrict__ x_tile,
+    int kk,
+    int shift_lo_01,
+    int shift_hi_01,
+    int shift_lo_89,
+    int shift_hi_89);
+
 __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
     const int32_t* __restrict__ w_fp4_q,
     const uint8_t* __restrict__ w_fp4_scales,
@@ -272,25 +287,42 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
     int k0) {
   float acc = 0.0f;
   const int slot_base = fp4_slot_base(n_in_tile);
+  const int shift_lo_01 = 4 * (slot_base + 0);
+  const int shift_hi_01 = 4 * (slot_base + 4);
+  const int shift_lo_89 = 4 * (slot_base + 1);
+  const int shift_hi_89 = 4 * (slot_base + 5);
+  const int scale_base = channel * (k / 16) + (k0 / 16);
+  const uint2 packed_scales =
+      reinterpret_cast<const uint2*>(w_fp4_scales + scale_base)[0];
+  const int qweight_base =
+      (k0 / 16) * fp4_row_stride + n_tile * 128 + fp4_word_offset(n_in_tile, 0);
+  const int32_t* __restrict__ row_ptr = w_fp4_q + qweight_base;
+  int32_t packed_regs[kNvfp4RegisterStages][4];
+
+  load_nvfp4_scalar_register_stage(row_ptr, packed_regs[0]);
+  if constexpr (kQweightTileKChunks > 1) {
+    load_nvfp4_scalar_register_stage(row_ptr + fp4_row_stride, packed_regs[1]);
+  }
 
   #pragma unroll
-  for (int kk = 0; kk < kBlockK; kk += 16) {
-    int row_base = ((k0 + kk) / 16) * fp4_row_stride + n_tile * 128;
-    float scale = fp8_e4m3_to_float(
-        w_fp4_scales[channel * (k / 16) + (k0 + kk) / 16]) *
+  for (int kk_block = 0; kk_block < kQweightTileKChunks; ++kk_block) {
+    const uint32_t scale_word =
+        (kk_block < 4) ? packed_scales.x : packed_scales.y;
+    const int scale_shift = (kk_block & 3) * 8;
+    const float scale =
+        fp8_e4m3_to_float((scale_word >> scale_shift) & 0xFF) *
         w_fp4_global_scale;
-    #pragma unroll
-    for (int group = 0; group < 4; ++group) {
-      const int packed = w_fp4_q[row_base + fp4_word_offset(n_in_tile, group)];
-      const int sub = group * 2;
-      acc += c_fp4_lut[(packed >> (4 * (slot_base + 0))) & 0xF] *
-             scale * __half2float(x_tile[kk + sub]);
-      acc += c_fp4_lut[(packed >> (4 * (slot_base + 4))) & 0xF] *
-             scale * __half2float(x_tile[kk + sub + 1]);
-      acc += c_fp4_lut[(packed >> (4 * (slot_base + 1))) & 0xF] *
-             scale * __half2float(x_tile[kk + sub + 8]);
-      acc += c_fp4_lut[(packed >> (4 * (slot_base + 5))) & 0xF] *
-             scale * __half2float(x_tile[kk + sub + 9]);
+    const int pipe = kk_block % kNvfp4RegisterStages;
+    const int kk = kk_block * 16;
+
+    acc += consume_nvfp4_scalar_register_stage(
+        packed_regs[pipe], scale, x_tile, kk,
+        shift_lo_01, shift_hi_01, shift_lo_89, shift_hi_89);
+
+    const int next_block = kk_block + kNvfp4RegisterStages;
+    if (next_block < kQweightTileKChunks) {
+      load_nvfp4_scalar_register_stage(
+          row_ptr + next_block * fp4_row_stride, packed_regs[pipe]);
     }
   }
 
@@ -330,6 +362,43 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_staged(
       acc += c_fp4_lut[(packed >> (4 * (slot_base + 5))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 9]);
     }
+  }
+
+  return acc;
+}
+
+__device__ __forceinline__ void load_nvfp4_scalar_register_stage(
+    const int32_t* __restrict__ row_ptr,
+    int32_t* __restrict__ packed_stage) {
+  #pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    packed_stage[group] = row_ptr[group * 4];
+  }
+}
+
+__device__ __forceinline__ float consume_nvfp4_scalar_register_stage(
+    const int32_t* __restrict__ packed_stage,
+    float scale,
+    const half* __restrict__ x_tile,
+    int kk,
+    int shift_lo_01,
+    int shift_hi_01,
+    int shift_lo_89,
+    int shift_hi_89) {
+  float acc = 0.0f;
+
+  #pragma unroll
+  for (int group = 0; group < 4; ++group) {
+    const int packed = packed_stage[group];
+    const int sub = group * 2;
+    acc += c_fp4_lut[(packed >> shift_lo_01) & 0xF] *
+           scale * __half2float(x_tile[kk + sub]);
+    acc += c_fp4_lut[(packed >> shift_hi_01) & 0xF] *
+           scale * __half2float(x_tile[kk + sub + 1]);
+    acc += c_fp4_lut[(packed >> shift_lo_89) & 0xF] *
+           scale * __half2float(x_tile[kk + sub + 8]);
+    acc += c_fp4_lut[(packed >> shift_hi_89) & 0xF] *
+           scale * __half2float(x_tile[kk + sub + 9]);
   }
 
   return acc;
