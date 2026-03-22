@@ -48,10 +48,14 @@ struct [[maybe_unused]] MarlinNvfp4TileShared {
 };
 
 constexpr int kMarlinNvfp4RedShStride = 2 * MarlinNvfp4Tile::kThreadNBlocks + 1;
+constexpr int kMarlinNvfp4BShStrideThreads = MarlinNvfp4Tile::kBShStride;
+constexpr int kMarlinNvfp4FragPairs = 4;
+// The local NVFP4 helper reuses Marlin's thread-block reduction address math.
+// Those indices assume a red buffer footprint at least as large as two B
+// shared-memory stages, even though the final write-out only consumes the much
+// smaller `(2 * thread_n_blocks + 1) * 16` logical window.
 constexpr int kMarlinNvfp4RedSize =
-    kMarlinNvfp4RedShStride * 16 * MarlinNvfp4Tile::kThreadMBlocks;
-constexpr int kMarlinNvfp4FragReduceFloats =
-    MarlinNvfp4Tile::kThreads * 32;
+    2 * MarlinNvfp4Tile::kBShStage;
 
 static_assert(kQweightTileKChunks % kFp8ChunkSubtiles == 0,
               "FP8 chunk staging expects an integer number of chunks per kBlockK");
@@ -272,7 +276,6 @@ stage_fp4_processed_scales_k_tile_marlin_nvfp4(
 [[maybe_unused]] __device__ __forceinline__ float
 run_nvfp4_qweight_k_tile_marlin_local(
     MarlinNvfp4TileShared& sh_tile,
-    float* __restrict__ sh_frag_reduce,
     int4* __restrict__ sh_red,
     half* __restrict__ sh_row0,
     half global_scale) {
@@ -316,32 +319,47 @@ run_nvfp4_qweight_k_tile_marlin_local(
     }
   }
 
-  float* frag_c_ptr = reinterpret_cast<float*>(frag_c);
-  float* sh_thread = sh_frag_reduce + threadIdx.x * 32;
-  #pragma unroll
-  for (int i = 0; i < 32; ++i) {
-    sh_thread[i] = frag_c_ptr[i];
-  }
-  __syncthreads();
+  constexpr int kRedOff = MarlinNvfp4Tile::kThreads /
+                          kMarlinNvfp4BShStrideThreads / 2;
+  if constexpr (kRedOff >= 1) {
+    const int red_idx = threadIdx.x / kMarlinNvfp4BShStrideThreads;
+    constexpr int kRedShStride = kMarlinNvfp4BShStrideThreads * 4 * 2;
+    constexpr int kRedShDelta = kMarlinNvfp4BShStrideThreads;
+    const int red_sh_rd =
+        kRedShStride * red_idx + (threadIdx.x % kMarlinNvfp4BShStrideThreads);
 
-  const int warp_id = threadIdx.x / 32;
-  const int warp_col = warp_id % MarlinNvfp4Tile::kTbNWarps;
-  const int warp_row = warp_id / MarlinNvfp4Tile::kTbNWarps;
-  if (warp_row == 0) {
     #pragma unroll
-    for (int src_row = 1; src_row < 4; ++src_row) {
-      const float* src =
-          sh_frag_reduce +
-          ((src_row * MarlinNvfp4Tile::kTbNWarps + warp_col) * 32 +
-           (threadIdx.x % 32)) *
-              32;
+    for (int i = kRedOff; i > 0; i /= 2) {
+      if (i <= red_idx && red_idx < 2 * i) {
+        #pragma unroll
+        for (int j = 0; j < kMarlinNvfp4FragPairs * 2; j += 2) {
+          const int red_sh_wr = kRedShDelta * j + (red_sh_rd - kRedShStride * i);
+          if (i < kRedOff) {
+            float* c_rd =
+                reinterpret_cast<float*>(&sh_red[kRedShDelta * j + red_sh_rd]);
+            float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+              reinterpret_cast<FragC*>(frag_c)[j][k] += c_rd[k] + c_wr[k];
+            }
+          }
+          sh_red[red_sh_wr] = reinterpret_cast<int4*>(frag_c)[j];
+        }
+      }
+      __syncthreads();
+    }
+    if (red_idx == 0) {
       #pragma unroll
-      for (int i = 0; i < 32; ++i) {
-        frag_c_ptr[i] += src[i];
+      for (int i = 0; i < kMarlinNvfp4FragPairs * 2; i += 2) {
+        float* c_rd = reinterpret_cast<float*>(&sh_red[kRedShDelta * i + red_sh_rd]);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          reinterpret_cast<FragC*>(frag_c)[i][j] += c_rd[j];
+        }
       }
     }
+    __syncthreads();
   }
-  __syncthreads();
 
   const half2 global_scale_h2 = __half2half2(global_scale);
   const int c_sh_stride = kMarlinNvfp4RedShStride;
@@ -1527,7 +1545,6 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_nvfp4_marlin_kernel(
     int32_t fp8_q_chunk[2][kFp8MaxWordsPer16Chunk];
   } sh_tile;
   __shared__ int4 sh_nvfp4_red[kMarlinNvfp4RedSize];
-  __shared__ float sh_nvfp4_frag_reduce[kMarlinNvfp4FragReduceFloats];
   __shared__ half sh_nvfp4_row0[kBlockN];
   __shared__ int last_slice_flag;
 
@@ -1578,7 +1595,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_nvfp4_marlin_kernel(
           tile.tile_base, k0, fp4_scale_row_stride);
       __syncthreads();
       acc += run_nvfp4_qweight_k_tile_marlin_local(
-          sh_tile.nvfp4, sh_nvfp4_frag_reduce, sh_nvfp4_red, sh_nvfp4_row0,
+          sh_tile.nvfp4, sh_nvfp4_red, sh_nvfp4_row0,
           fp4_global_scale);
     } else {
       const int words_per_k_chunk = fp8_words_per_k_chunk(tile.valid_channels);
