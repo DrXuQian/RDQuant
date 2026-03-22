@@ -171,6 +171,9 @@ def main():
                         help="Device (default: cuda)")
     parser.add_argument("--cuda-graph", action="store_true",
                         help="Use CUDA Graph capture for fixed-shape prefill/decode")
+    parser.add_argument("--baseline-dtype", type=str, default="bf16",
+                        choices=("bf16", "fp16"),
+                        help="Precision for the dense HuggingFace baseline (default: bf16)")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -181,21 +184,23 @@ def main():
 
     # --- BF16 baseline ---
     if args.model is not None:
-        print(f"Loading BF16 model from {args.model} ...")
+        baseline_name = args.baseline_dtype.upper()
+        print(f"Loading {baseline_name} model from {args.model} ...")
         from transformers import AutoModelForCausalLM
+        baseline_dtype = torch.bfloat16 if args.baseline_dtype == "bf16" else torch.float16
         if args.cuda_graph:
             bf16_model = AutoModelForCausalLM.from_pretrained(
-                args.model, dtype=torch.bfloat16, trust_remote_code=True,
+                args.model, dtype=baseline_dtype, trust_remote_code=True,
             ).to(args.device)
         else:
             bf16_model = AutoModelForCausalLM.from_pretrained(
-                args.model, torch_dtype=torch.bfloat16, device_map=args.device,
+                args.model, torch_dtype=baseline_dtype, device_map=args.device,
             )
         bf16_model.eval()
 
-        print("Benchmarking BF16 ...")
+        print(f"Benchmarking {baseline_name} ...")
         bench_fn = _benchmark_model_cuda_graph if args.cuda_graph else _benchmark_model
-        results["BF16"] = bench_fn(
+        results[baseline_name] = bench_fn(
             bf16_model, tokenizer, args.device,
             seq_len=args.seq_len, warmup=args.warmup, iters=args.iters,
         )
@@ -226,8 +231,9 @@ def main():
     for name, res in results.items():
         print(f"{name:<20} {res['prefill_ms']:>14.2f} {res['decode_ms']:>14.2f}")
 
-    if "BF16" in results and "RDQuant-Marlin" in results:
-        bf16 = results["BF16"]
+    baseline_name = args.baseline_dtype.upper()
+    if baseline_name in results and "RDQuant-Marlin" in results:
+        bf16 = results[baseline_name]
         rdq = results["RDQuant-Marlin"]
         print("-" * 60)
         prefill_speedup = bf16["prefill_ms"] / rdq["prefill_ms"] if rdq["prefill_ms"] > 0 else float("inf")
