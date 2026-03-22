@@ -192,6 +192,13 @@ Current progress on this sequence:
     - `down_proj` narrow path: MIO throttle `18.02 -> 15.19`
   So the helper-side register staging is behaving as intended even though the
   total kernel duration gain is still modest.
+- The next effective cleanup turned out not to be deeper buffering, but
+  eliminating the compact-map table lookups from the hot path. The Marlin
+  repack permutation fixes the per-thread access pattern tightly enough that
+  both FP8 word offsets and NVFP4 word/slot offsets can be recovered from
+  `n_in_tile` with integer formulas. That removes a batch of helper-side loads
+  without changing the external ABI, which is useful because the current
+  kernels are constrained more by scoreboard/MIO pressure than by raw DRAM.
 
 ## Why FP8 First
 

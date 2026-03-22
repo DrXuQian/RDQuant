@@ -218,6 +218,22 @@ Observed result on RTX 5090:
   refilling the slot for the subtile two steps ahead. This is a structural move
   toward Marlin's register pipeline even though the current end-to-end latency
   impact is still mixed.
+- The compact Marlin group maps (`fp4_word_offsets`, `fp4_slot_map`,
+  `fp8_word_offsets`) are no longer consulted in the mixed-kernel hot path.
+  Their access pattern is fixed by the Marlin repack permutation, so the kernel
+  now reconstructs the required per-thread word offsets and NVFP4 nibble-slot
+  pattern with integer formulas. This removes several per-thread table loads
+  from the inner loop without changing the Python/C++ interface.
+- On the latest RTX 5090 validation run after that change, the current
+  best-of-available split-K path is roughly:
+  - `q_proj`: `29.3us`
+  - `k_proj`: `18.7us`
+  - `v_proj`: `18.7us`
+  - `o_proj`: `34.7us`
+  - `gate_proj`: `45.1us`
+  - `up_proj`: `60.7us`
+  - `down_proj`: `60.4us`
+  for a total near `268us` across the 7 decode layers.
 - The split-K FP8 chunk helpers now also use explicit register staging instead
   of rebuilding the same packed-word and `x` fragment state inside each
   `16-K`/`32-K` helper call. On RTX 5090 this produces a small but repeatable

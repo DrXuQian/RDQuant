@@ -133,6 +133,18 @@ __device__ __forceinline__ int fp4_words_per_k_chunk(int valid_channels) {
   return ((valid_channels + 63) / 64) * kFp4WordsPerSubtile;
 }
 
+__device__ __forceinline__ int fp4_word_offset(int n_in_tile, int group) {
+  return ((n_in_tile & 7) << 4) + (n_in_tile >> 4) + (group << 2);
+}
+
+__device__ __forceinline__ int fp8_word_offset(int n_in_tile, int group) {
+  return ((n_in_tile & 7) << 5) + (n_in_tile >> 3) + (group << 3);
+}
+
+__device__ __forceinline__ int fp4_slot_base(int n_in_tile) {
+  return ((n_in_tile >> 3) & 1) << 1;
+}
+
 __device__ __forceinline__ void dequant_fp8_word_to_half2_pairs(
     int q, half2* frag_b) {
   constexpr int kFp8Exponent = 4;
@@ -249,15 +261,15 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
     const int32_t* __restrict__ w_fp4_q,
     const uint8_t* __restrict__ w_fp4_scales,
     float w_fp4_global_scale,
-    const int32_t* __restrict__ fp4_word_row,
-    const int32_t* __restrict__ fp4_slot_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int channel,
     int n_tile,
     int fp4_row_stride,
     int k,
     int k0) {
   float acc = 0.0f;
+  const int slot_base = fp4_slot_base(n_in_tile);
 
   #pragma unroll
   for (int kk = 0; kk < kBlockK; kk += 16) {
@@ -267,17 +279,15 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_scalar(
         w_fp4_global_scale;
     #pragma unroll
     for (int group = 0; group < 4; ++group) {
-      int packed = w_fp4_q[row_base + fp4_word_row[group]];
-      const int32_t* slot_group = fp4_slot_row + group * 4;
-
-      int sub = group * 2;
-      acc += c_fp4_lut[(packed >> (4 * slot_group[0])) & 0xF] *
+      const int packed = w_fp4_q[row_base + fp4_word_offset(n_in_tile, group)];
+      const int sub = group * 2;
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 0))) & 0xF] *
              scale * __half2float(x_tile[kk + sub]);
-      acc += c_fp4_lut[(packed >> (4 * slot_group[1])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 4))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 1]);
-      acc += c_fp4_lut[(packed >> (4 * slot_group[2])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 1))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 8]);
-      acc += c_fp4_lut[(packed >> (4 * slot_group[3])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 5))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 9]);
     }
   }
@@ -289,13 +299,13 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_staged(
     const int32_t* __restrict__ sh_fp4_q_tile,
     const uint8_t* __restrict__ sh_fp4_scales,
     float w_fp4_global_scale,
-    const int32_t* __restrict__ fp4_word_row,
-    const int32_t* __restrict__ fp4_slot_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int local_channel,
     int local_n_tile,
     int words_per_k_chunk) {
   float acc = 0.0f;
+  const int slot_base = fp4_slot_base(n_in_tile);
 
   #pragma unroll
   for (int kk = 0; kk < kBlockK; kk += 16) {
@@ -306,17 +316,16 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile_staged(
         w_fp4_global_scale;
     #pragma unroll
     for (int group = 0; group < 4; ++group) {
-      const int packed = sh_fp4_q_tile[row_base + fp4_word_row[group]];
-      const int32_t* slot_group = fp4_slot_row + group * 4;
-
+      const int packed =
+          sh_fp4_q_tile[row_base + fp4_word_offset(n_in_tile, group)];
       const int sub = group * 2;
-      acc += c_fp4_lut[(packed >> (4 * slot_group[0])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 0))) & 0xF] *
              scale * __half2float(x_tile[kk + sub]);
-      acc += c_fp4_lut[(packed >> (4 * slot_group[1])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 4))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 1]);
-      acc += c_fp4_lut[(packed >> (4 * slot_group[2])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 1))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 8]);
-      acc += c_fp4_lut[(packed >> (4 * slot_group[3])) & 0xF] *
+      acc += c_fp4_lut[(packed >> (4 * (slot_base + 5))) & 0xF] *
              scale * __half2float(x_tile[kk + sub + 9]);
     }
   }
@@ -330,8 +339,8 @@ __device__ __forceinline__ float sum_half2(half2 x) {
 
 __device__ __forceinline__ void load_fp8_register_stage(
     const int32_t* __restrict__ sh_fp8_q_tile,
-    const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int local_n_tile,
     int words_per_k_chunk,
     int kk,
@@ -343,7 +352,7 @@ __device__ __forceinline__ void load_fp8_register_stage(
 
   #pragma unroll
   for (int group = 0; group < 4; ++group) {
-    packed_stage[group] = sh_fp8_q_tile[row_base + fp8_word_row[group]];
+    packed_stage[group] = sh_fp8_q_tile[row_base + fp8_word_offset(n_in_tile, group)];
     const int sub = group * 2;
     x01_stage[group] = __halves2half2(x_tile[kk + sub], x_tile[kk + sub + 1]);
     x89_stage[group] = __halves2half2(x_tile[kk + sub + 8], x_tile[kk + sub + 9]);
@@ -352,8 +361,8 @@ __device__ __forceinline__ void load_fp8_register_stage(
 
 __device__ __forceinline__ void load_fp8_chunk_register_stage(
     const int32_t* __restrict__ sh_fp8_q_chunk,
-    const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int local_n_tile,
     int words_per_k_chunk,
     int chunk_subtile,
@@ -366,7 +375,8 @@ __device__ __forceinline__ void load_fp8_chunk_register_stage(
 
   #pragma unroll
   for (int group = 0; group < 4; ++group) {
-    packed_stage[group] = sh_fp8_q_chunk[row_base + fp8_word_row[group]];
+    packed_stage[group] =
+        sh_fp8_q_chunk[row_base + fp8_word_offset(n_in_tile, group)];
     const int sub = group * 2;
     x01_stage[group] =
         __halves2half2(x_tile[x_kk + sub], x_tile[x_kk + sub + 1]);
@@ -400,8 +410,8 @@ __device__ __forceinline__ float consume_fp8_register_stage(
 __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
     const int32_t* __restrict__ sh_fp8_q_tile,
     const float* __restrict__ w_fp8_scales,
-    const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int channel,
     int local_n_tile,
     int words_per_k_chunk) {
@@ -413,11 +423,11 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
   float acc = 0.0f;
 
   load_fp8_register_stage(
-      sh_fp8_q_tile, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk, 0,
+      sh_fp8_q_tile, x_tile, n_in_tile, local_n_tile, words_per_k_chunk, 0,
       packed_regs[0], x01_regs[0], x89_regs[0]);
   if constexpr (kKSubtiles > 1) {
     load_fp8_register_stage(
-        sh_fp8_q_tile, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk,
+        sh_fp8_q_tile, x_tile, n_in_tile, local_n_tile, words_per_k_chunk,
         16, packed_regs[1], x01_regs[1], x89_regs[1]);
   }
 
@@ -430,7 +440,7 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
     const int next_block = kk_block + kFp8RegisterStages;
     if (next_block < kKSubtiles) {
       load_fp8_register_stage(
-          sh_fp8_q_tile, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk,
+          sh_fp8_q_tile, x_tile, n_in_tile, local_n_tile, words_per_k_chunk,
           next_block * 16, packed_regs[pipe], x01_regs[pipe], x89_regs[pipe]);
     }
   }
@@ -441,8 +451,8 @@ __device__ __forceinline__ float run_fp8_qweight_k_tile_half2(
 __device__ __forceinline__ float run_fp8_qweight_16_chunk_half2(
     const int32_t* __restrict__ sh_fp8_q_chunk,
     half2 scale_h2,
-    const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int local_n_tile,
     int words_per_k_chunk,
     int kk) {
@@ -450,7 +460,7 @@ __device__ __forceinline__ float run_fp8_qweight_16_chunk_half2(
   half2 x01_regs[4];
   half2 x89_regs[4];
   load_fp8_chunk_register_stage(
-      sh_fp8_q_chunk, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk, 0, kk,
+      sh_fp8_q_chunk, x_tile, n_in_tile, local_n_tile, words_per_k_chunk, 0, kk,
       packed_regs, x01_regs, x89_regs);
   return consume_fp8_register_stage(packed_regs, x01_regs, x89_regs, scale_h2);
 }
@@ -458,8 +468,8 @@ __device__ __forceinline__ float run_fp8_qweight_16_chunk_half2(
 __device__ __forceinline__ float run_fp8_qweight_chunk_half2(
     const int32_t* __restrict__ sh_fp8_q_chunk,
     half2 scale_h2,
-    const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int local_n_tile,
     int words_per_k_chunk,
     int kk_base) {
@@ -471,7 +481,7 @@ __device__ __forceinline__ float run_fp8_qweight_chunk_half2(
   #pragma unroll
   for (int subtile = 0; subtile < kFp8ChunkSubtiles; ++subtile) {
     load_fp8_chunk_register_stage(
-        sh_fp8_q_chunk, fp8_word_row, x_tile, local_n_tile, words_per_k_chunk,
+        sh_fp8_q_chunk, x_tile, n_in_tile, local_n_tile, words_per_k_chunk,
         subtile, kk_base + subtile * 16, packed_regs[subtile],
         x01_regs[subtile], x89_regs[subtile]);
   }
@@ -615,27 +625,26 @@ __device__ __forceinline__ float run_nvfp4_qweight_k_tile(
     const int32_t* __restrict__ sh_fp4_q_tile,
     const uint8_t* __restrict__ sh_fp4_scales,
     float w_fp4_global_scale,
-    const int32_t* __restrict__ fp4_word_row,
-    const int32_t* __restrict__ fp4_slot_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int local_channel,
     int local_n_tile,
     int words_per_k_chunk) {
   return run_nvfp4_qweight_k_tile_staged(
-      sh_fp4_q_tile, sh_fp4_scales, w_fp4_global_scale, fp4_word_row,
-      fp4_slot_row, x_tile, local_channel, local_n_tile, words_per_k_chunk);
+      sh_fp4_q_tile, sh_fp4_scales, w_fp4_global_scale, x_tile, n_in_tile,
+      local_channel, local_n_tile, words_per_k_chunk);
 }
 
 __device__ __forceinline__ float run_fp8_qweight_k_tile(
     const int32_t* __restrict__ sh_fp8_q_tile,
     const float* __restrict__ w_fp8_scales,
-    const int32_t* __restrict__ fp8_word_row,
     const half* __restrict__ x_tile,
+    int n_in_tile,
     int channel,
     int local_n_tile,
     int words_per_k_chunk) {
   return run_fp8_qweight_k_tile_half2(
-      sh_fp8_q_tile, w_fp8_scales, fp8_word_row, x_tile, channel,
+      sh_fp8_q_tile, w_fp8_scales, x_tile, n_in_tile, channel,
       local_n_tile, words_per_k_chunk);
 }
 
@@ -720,9 +729,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
   int local_channel = threadIdx.x;
   int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
-  const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
-  const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
-  const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+  (void)fp4_word_offsets;
+  (void)fp4_slot_map;
+  (void)fp8_word_offsets;
 
   for (int k0 = 0; k0 < k; k0 += kBlockK) {
     stage_x_tile<kBlockK>(x, k0, x_tile);
@@ -747,11 +756,11 @@ __global__ void fused_mixed_gemv_marlin_qweight_kernel(
       if (tile.kind == kTileNVFP4) {
         acc += run_nvfp4_qweight_k_tile(
             sh_q_tile.fp4_q, sh_fp4_scales, w_fp4_global_scale,
-            fp4_word_row, fp4_slot_row, x_tile, local_channel, local_n_tile,
+            x_tile, n_in_tile, local_channel, local_n_tile,
             fp4_words_per_k_chunk(tile.valid_channels));
       } else {
         acc += run_fp8_qweight_k_tile(
-            sh_q_tile.fp8_q, w_fp8_scales, fp8_word_row, x_tile, lane_channel,
+            sh_q_tile.fp8_q, w_fp8_scales, x_tile, n_in_tile, lane_channel,
             local_n_tile, fp8_words_per_k_chunk(tile.valid_channels));
       }
     }
@@ -811,9 +820,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
   int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
   const bool is_fp8_tile = tile.kind == kTileFP8;
-  const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
-  const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
-  const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+  (void)fp4_word_offsets;
+  (void)fp4_slot_map;
+  (void)fp8_word_offsets;
   const half2 fp8_scale_h2 =
       (active && is_fp8_tile) ? __float2half2_rn(w_fp8_scales[lane_channel])
                               : __float2half2_rn(0.0f);
@@ -826,7 +835,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
       if (!is_fp8_tile) {
         acc += run_nvfp4_qweight_k_tile_scalar(
             w_fp4_q, w_fp4_scales, w_fp4_global_scale,
-            fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
+            x_tile, n_in_tile, lane_channel, n_tile,
             fp4_row_stride, k, k0);
       }
     }
@@ -852,7 +861,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_kernel(
 
         if (active) {
           acc += run_fp8_qweight_16_chunk_half2(
-              sh_fp8_q_chunk[pipe], fp8_scale_h2, fp8_word_row, x_tile,
+              sh_fp8_q_chunk[pipe], fp8_scale_h2, x_tile, n_in_tile,
               local_n_tile, words_per_k_chunk, kk_block * 16);
         }
 
@@ -939,9 +948,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel(
   int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
   const bool is_fp8_tile = tile.kind == kTileFP8;
-  const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
-  const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
-  const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+  (void)fp4_word_offsets;
+  (void)fp4_slot_map;
+  (void)fp8_word_offsets;
   const half2 fp8_scale_h2 =
       (active && is_fp8_tile) ? __float2half2_rn(w_fp8_scales[lane_channel])
                               : __float2half2_rn(0.0f);
@@ -954,7 +963,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel(
       if (!is_fp8_tile) {
         acc += run_nvfp4_qweight_k_tile_scalar(
             w_fp4_q, w_fp4_scales, w_fp4_global_scale,
-            fp4_word_row, fp4_slot_row, x_tile, lane_channel, n_tile,
+            x_tile, n_in_tile, lane_channel, n_tile,
             fp4_row_stride, k, k0);
       }
     }
@@ -980,7 +989,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_wide_fp8_kernel(
 
         if (active) {
           acc += run_fp8_qweight_chunk_half2(
-              sh_fp8_q_chunk[pipe], fp8_scale_h2, fp8_word_row, x_tile,
+              sh_fp8_q_chunk[pipe], fp8_scale_h2, x_tile, n_in_tile,
               local_n_tile, words_per_k_chunk, kk_block * 16);
         }
 
@@ -1070,9 +1079,9 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
   int local_channel = threadIdx.x;
   int local_n_tile = threadIdx.x / 64;
   int n_in_tile = lane_channel % 64;
-  const int32_t* fp4_word_row = fp4_word_offsets + n_in_tile * 4;
-  const int32_t* fp4_slot_row = fp4_slot_map + n_in_tile * 16;
-  const int32_t* fp8_word_row = fp8_word_offsets + n_in_tile * 4;
+  (void)fp4_word_offsets;
+  (void)fp4_slot_map;
+  (void)fp8_word_offsets;
   const bool is_fp8_tile = tile.kind == kTileFP8;
   const half2 fp8_scale_h2 =
       (active && is_fp8_tile) ? __float2half2_rn(w_fp8_scales[lane_channel])
@@ -1095,7 +1104,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
       if (!is_fp8_tile) {
         acc += run_nvfp4_qweight_k_tile(
             sh_q_tile.fp4_q, sh_fp4_scales, w_fp4_global_scale,
-            fp4_word_row, fp4_slot_row, x_tile, local_channel, local_n_tile,
+            x_tile, n_in_tile, local_channel, local_n_tile,
             fp4_words_per_k_chunk(tile.valid_channels));
       }
     }
@@ -1121,7 +1130,7 @@ __global__ void fused_mixed_gemv_marlin_qweight_splitk_staged_nvfp4_kernel(
 
         if (active) {
           acc += run_fp8_qweight_chunk_half2(
-              sh_q_tile.fp8_q_chunk[pipe], fp8_scale_h2, fp8_word_row, x_tile,
+              sh_q_tile.fp8_q_chunk[pipe], fp8_scale_h2, x_tile, n_in_tile,
               local_n_tile, words_per_k_chunk, kk_block * 16);
         }
 
