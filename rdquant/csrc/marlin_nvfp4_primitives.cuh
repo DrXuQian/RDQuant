@@ -23,10 +23,12 @@ struct Tile128x128x128 {
   static constexpr int kThreadNBlocks = 8;
   static constexpr int kThreadKBlocks = 8;
   static constexpr int kStages = 4;
+  static constexpr bool kMBlockSize8 = true;
+  static constexpr int kMBlockSize = 8;
   static constexpr int kTbNWarps = kThreadNBlocks / 4;
   static constexpr int kBShWrIters = 2;
   static constexpr int kAShStride = 16;
-  static constexpr int kAShStage = 256;
+  static constexpr int kAShStage = kAShStride * kMBlockSize;
   static constexpr int kBShStride = 64;
   static constexpr int kBShStage = 512;
   static constexpr int kSShStride = 8;
@@ -40,7 +42,7 @@ struct Tile128x128x128 {
   __device__ static inline int a_sh_rd(int lane) {
     int warp = lane / 32;
     int lane_in_warp = lane % 32;
-    return kAShStride * (lane_in_warp % 16) + lane_in_warp / 16 +
+    return kAShStride * (lane_in_warp % 8) + lane_in_warp / 8 +
            2 * (warp / kTbNWarps) * kBShWrIters;
   }
 
@@ -106,6 +108,15 @@ __device__ inline void mma_fp16(
   rdq_marlin::mma<vllm::kFloat16.id(), false>(frag_a, frag_b, frag_c);
 }
 
+__device__ inline void mma_fp16_trans(
+    const FragA& frag_a,
+    const FragB& frag_b0,
+    const FragB& frag_b1,
+    FragC& frag_c) {
+  rdq_marlin::mma_trans<vllm::kFloat16.id(), false>(
+      frag_a, frag_b0, frag_b1, frag_c);
+}
+
 __device__ inline void zero_frag_c(FragC& frag_c) {
   #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -115,14 +126,17 @@ __device__ inline void zero_frag_c(FragC& frag_c) {
 
 __device__ inline void load_frag_a_tile128(
     const int4* sh_a, int lane, int k_step, FragA& frag_a) {
-  ldsm_a<4>(frag_a, &sh_a[Tile128x128x128::a_sh_rd_trans(lane, k_step)]);
+  ldsm_a<2>(frag_a, &sh_a[Tile128x128x128::a_sh_rd_trans(lane, k_step)]);
 }
 
 __device__ inline int load_qweight_int_tile128(
     const int4* sh_b, int lane, int k_step, int j) {
   const int* sh_b_int = reinterpret_cast<const int*>(sh_b);
-  return sh_b_int[Tile128x128x128::kBShStride * (k_step % Tile128x128x128::kBShWrIters) +
-                  Tile128x128x128::b_sh_rd(lane) + j];
+  const int int4_idx =
+      Tile128x128x128::kBShStride *
+          (k_step % Tile128x128x128::kBShWrIters) +
+      Tile128x128x128::b_sh_rd(lane);
+  return sh_b_int[int4_idx * 4 + j];
 }
 
 __device__ inline void load_scale_frags_tile128(

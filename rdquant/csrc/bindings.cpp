@@ -751,6 +751,91 @@ torch::Tensor fused_mixed_gemv_marlin_weights_splitk_auto_torch(
     return y;
 }
 
+torch::Tensor fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin_torch(
+    const torch::Tensor &x,
+    const torch::Tensor &w_fp4_q,
+    const torch::Tensor &w_fp4_scales_marlin,
+    const torch::Tensor &w_fp4_global_scale_marlin,
+    const torch::Tensor &w_fp8_q,
+    const torch::Tensor &w_fp8_scales,
+    const torch::Tensor &fp4_word_offsets,
+    const torch::Tensor &fp4_slot_map,
+    const torch::Tensor &fp8_word_offsets,
+    const torch::Tensor &inv_perm,
+    const torch::Tensor &workspace,
+    const torch::Tensor &tile_counters,
+    int N_fp4, int N_fp8, int K, int parallel_k
+)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(w_fp4_q.is_cuda() && w_fp4_scales_marlin.is_cuda() &&
+                    w_fp4_global_scale_marlin.is_cuda() && w_fp8_q.is_cuda() &&
+                    w_fp8_scales.is_cuda() && fp4_word_offsets.is_cuda() &&
+                    fp4_slot_map.is_cuda() && fp8_word_offsets.is_cuda() &&
+                    inv_perm.is_cuda(),
+                "all fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin inputs must be CUDA tensors");
+    TORCH_CHECK(x.dtype() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) == 1,
+                "fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin currently only supports M=1");
+    TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128");
+    TORCH_CHECK(N_fp4 % 64 == 0 && N_fp8 % 64 == 0,
+                "N_fp4 and N_fp8 must be multiples of 64 for the Marlin-packed prototype");
+    TORCH_CHECK(w_fp4_q.dtype() == torch::kInt32 && w_fp8_q.dtype() == torch::kInt32,
+                "Marlin qweights must be int32");
+    TORCH_CHECK(w_fp4_q.size(0) * 16 == K && w_fp4_q.size(1) == N_fp4 * 2,
+                "w_fp4_q must have shape [K/16, N_fp4*2]");
+    TORCH_CHECK(w_fp4_scales_marlin.numel() == (K / 16) * N_fp4,
+                "w_fp4_scales_marlin must contain K/16 * N_fp4 processed scale values");
+    TORCH_CHECK(w_fp4_global_scale_marlin.numel() == 1,
+                "w_fp4_global_scale_marlin must be a scalar tensor");
+    TORCH_CHECK(w_fp8_q.size(0) * 16 == K && w_fp8_q.size(1) == N_fp8 * 4,
+                "w_fp8_q must have shape [K/16, N_fp8*4]");
+    TORCH_CHECK(w_fp8_scales.numel() == N_fp8, "w_fp8_scales must have N_fp8 elements");
+    TORCH_CHECK(fp4_word_offsets.dtype() == torch::kInt32 &&
+                    fp4_slot_map.dtype() == torch::kInt32 &&
+                    fp8_word_offsets.dtype() == torch::kInt32,
+                "compact Marlin maps must be int32");
+    TORCH_CHECK(inv_perm.numel() == N_fp4 + N_fp8, "inv_perm must have N_fp4 + N_fp8 elements");
+    TORCH_CHECK(workspace.is_cuda() && tile_counters.is_cuda(),
+                "workspace and tile_counters must be CUDA tensors");
+    TORCH_CHECK(workspace.dtype() == torch::kFloat32, "workspace must be float32");
+    TORCH_CHECK(tile_counters.dtype() == torch::kInt32, "tile_counters must be int32");
+    TORCH_CHECK(parallel_k >= 1, "parallel_k must be >= 1");
+
+    int num_fp4_tiles = (N_fp4 + 127) / 128;
+    int num_fp8_tiles = (N_fp8 + 127) / 128;
+    int num_tiles = num_fp4_tiles + num_fp8_tiles;
+    int num_k_tiles = K / 128;
+    TORCH_CHECK(parallel_k <= num_k_tiles,
+                "parallel_k must be <= K/128 for the split-K prototype");
+    TORCH_CHECK(workspace.numel() == N_fp4 + N_fp8,
+                "workspace must have N_fp4 + N_fp8 elements");
+    TORCH_CHECK(tile_counters.numel() == num_tiles,
+                "tile_counters must have one counter per output tile");
+
+    auto y = torch::empty({1, N_fp4 + N_fp8},
+        torch::dtype(torch::kFloat16).device(x.device()));
+
+    fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin(
+        x.data_ptr(),
+        w_fp4_q.data_ptr<int32_t>(),
+        w_fp4_scales_marlin.data_ptr(),
+        w_fp4_global_scale_marlin.data_ptr(),
+        w_fp8_q.data_ptr<int32_t>(),
+        w_fp8_scales.data_ptr<float>(),
+        fp4_word_offsets.data_ptr<int32_t>(),
+        fp4_slot_map.data_ptr<int32_t>(),
+        fp8_word_offsets.data_ptr<int32_t>(),
+        inv_perm.data_ptr<int32_t>(),
+        workspace.data_ptr<float>(),
+        tile_counters.data_ptr<int32_t>(),
+        y.data_ptr(),
+        N_fp4, N_fp8, K, parallel_k
+    );
+
+    return y;
+}
+
 // ============================================================================
 // PyBind11 module definition
 // ============================================================================
@@ -912,6 +997,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Returns: y[1, N_total] fp16",
           py::arg("x"), py::arg("w_fp4_q"), py::arg("w_fp4_scales"),
           py::arg("w_fp4_global_scale"),
+          py::arg("w_fp8_q"), py::arg("w_fp8_scales"),
+          py::arg("fp4_word_offsets"), py::arg("fp4_slot_map"),
+          py::arg("fp8_word_offsets"),
+          py::arg("inv_perm"), py::arg("workspace"), py::arg("tile_counters"),
+          py::arg("N_fp4"), py::arg("N_fp8"), py::arg("K"),
+          py::arg("parallel_k"));
+
+    m.def("fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin",
+          &fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin_torch,
+          "Experimental split-K fused mixed GEMV with Marlin-style NVFP4 tiles\n"
+          "Args: x[1,K] fp16, w_fp4_q[K/16,N_fp4*2] int32,\n"
+          "      w_fp4_scales_marlin[K/16,N_fp4] processed NVFP4 scales,\n"
+          "      w_fp4_global_scale_marlin[1] processed scalar,\n"
+          "      w_fp8_q[K/16,N_fp8*4] int32, w_fp8_scales[N_fp8] float32,\n"
+          "      fp4_word_offsets[64,4] int32, fp4_slot_map[64,4,4] int32,\n"
+          "      fp8_word_offsets[64,4] int32, inv_perm[N_total] int32,\n"
+          "      workspace[N_total] float32, tile_counters[num_tiles] int32,\n"
+          "      N_fp4, N_fp8, K, parallel_k\n"
+          "Returns: y[1, N_total] fp16",
+          py::arg("x"), py::arg("w_fp4_q"), py::arg("w_fp4_scales_marlin"),
+          py::arg("w_fp4_global_scale_marlin"),
           py::arg("w_fp8_q"), py::arg("w_fp8_scales"),
           py::arg("fp4_word_offsets"), py::arg("fp4_slot_map"),
           py::arg("fp8_word_offsets"),

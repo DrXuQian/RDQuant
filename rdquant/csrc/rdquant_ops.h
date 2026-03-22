@@ -157,6 +157,25 @@ void fused_mixed_gemv_marlin_weights_splitk_wide_fp8(
     int N_fp4, int N_fp8, int K, int parallel_k
 );
 
+// Experimental split-K mixed GEMV lane where NVFP4 tiles use a local
+// Marlin-style tile engine with processed Marlin scales/global scale.
+void fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin(
+    const void *x,
+    const void *w_fp4_q,
+    const void *w_fp4_scales_marlin,
+    const void *w_fp4_global_scale_marlin,
+    const void *w_fp8_q,
+    const void *w_fp8_scales,
+    const void *fp4_word_offsets,
+    const void *fp4_slot_map,
+    const void *fp8_word_offsets,
+    const void *inv_perm,
+    void *workspace,
+    void *tile_counters,
+    void *y,
+    int N_fp4, int N_fp8, int K, int parallel_k
+);
+
 // Alternate split-K transition kernel where the NVFP4 path also stages qweight
 // and block scales through shared memory before the mixed inner loop.
 void fused_mixed_gemv_marlin_weights_splitk_staged_nvfp4(
