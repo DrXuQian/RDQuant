@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 
 import torch
 
@@ -101,6 +100,61 @@ def _benchmark_model(
     return {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
 
 
+def _benchmark_model_cuda_graph(
+    model,
+    tokenizer,
+    device: str,
+    seq_len: int,
+    warmup: int,
+    iters: int,
+) -> dict[str, float]:
+    """Run eager prefill plus CUDA Graph decode benchmark.
+
+    Qwen3's HuggingFace attention-mask construction is not capture-safe in the
+    current environment, so the graph path uses fixed random token ids without
+    an explicit attention mask, matching the working profiling harness.
+    """
+    del tokenizer
+    vocab_size = getattr(model.config, "vocab_size", 151936)
+    input_ids = torch.randint(0, vocab_size, (1, seq_len), device=device)
+
+    @torch.no_grad()
+    def prefill_fn():
+        return model(input_ids, use_cache=True)
+
+    prefill_ms = _cuda_timer(prefill_fn, warmup=warmup, iters=iters)
+
+    with torch.no_grad():
+        prefill_out = prefill_fn()
+    past_key_values = prefill_out.past_key_values
+    static_decode_input_ids = input_ids[:, -1:].clone()
+
+    for _ in range(max(warmup, 3)):
+        with torch.no_grad():
+            model(
+                static_decode_input_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+    torch.cuda.synchronize()
+
+    g_decode = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g_decode):
+        model(
+            static_decode_input_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+    torch.cuda.synchronize()
+
+    def decode_graph_fn():
+        g_decode.replay()
+
+    decode_ms = _cuda_timer(decode_graph_fn, warmup=warmup, iters=iters)
+
+    return {"prefill_ms": prefill_ms, "decode_ms": decode_ms}
+
+
 def main():
     parser = argparse.ArgumentParser(description="RDQuant end-to-end latency benchmark")
     parser.add_argument("--checkpoint", type=str, required=True,
@@ -115,6 +169,8 @@ def main():
                         help="Sequence length for prefill (default: 128)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device (default: cuda)")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="Use CUDA Graph capture for fixed-shape prefill/decode")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
@@ -127,13 +183,19 @@ def main():
     if args.model is not None:
         print(f"Loading BF16 model from {args.model} ...")
         from transformers import AutoModelForCausalLM
-        bf16_model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, device_map=args.device,
-        )
+        if args.cuda_graph:
+            bf16_model = AutoModelForCausalLM.from_pretrained(
+                args.model, dtype=torch.bfloat16, trust_remote_code=True,
+            ).to(args.device)
+        else:
+            bf16_model = AutoModelForCausalLM.from_pretrained(
+                args.model, torch_dtype=torch.bfloat16, device_map=args.device,
+            )
         bf16_model.eval()
 
         print("Benchmarking BF16 ...")
-        results["BF16"] = _benchmark_model(
+        bench_fn = _benchmark_model_cuda_graph if args.cuda_graph else _benchmark_model
+        results["BF16"] = bench_fn(
             bf16_model, tokenizer, args.device,
             seq_len=args.seq_len, warmup=args.warmup, iters=args.iters,
         )
@@ -151,7 +213,8 @@ def main():
     rdq_model.eval()
 
     print("Benchmarking RDQuant Marlin ...")
-    results["RDQuant-Marlin"] = _benchmark_model(
+    bench_fn = _benchmark_model_cuda_graph if args.cuda_graph else _benchmark_model
+    results["RDQuant-Marlin"] = bench_fn(
         rdq_model, tokenizer, args.device,
         seq_len=args.seq_len, warmup=args.warmup, iters=args.iters,
     )
