@@ -9,7 +9,9 @@ Provides two one-click interfaces:
     and save as a packed checkpoint.
 
 Also defines :class:`MarlinMixedLinear`, a drop-in ``nn.Module`` that runs
-two Marlin GEMMs (NVFP4 + FP8) and concatenates/permutes the results.
+two Marlin GEMMs (NVFP4 + FP8) and concatenates/permutes the results, plus
+``FusedMixedLinear`` which uses the fused mixed-GEMV CUDA path for decode
+(``M == 1``) and falls back to Marlin for larger batches / prefill.
 
 vLLM dependency is **conditional**: Marlin mode requires vLLM custom ops,
 but fake-quant mode works without it.
@@ -25,6 +27,13 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from rdquant.fused_gemv_pack import (
+    build_marlin_data,
+    fused_gemv_available,
+    get_rdquant_cuda,
+    pack_for_fused_gemv,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +300,181 @@ class MarlinMixedLinear(nn.Module):
         return y.reshape(*orig_shape[:-1], self.N)
 
 
+class FusedMixedLinear(nn.Module):
+    """Packed mixed linear with fused decode GEMV and Marlin fallback.
+
+    The decode fast path currently targets the stable fused split-K kernel:
+
+    - only when ``M == 1`` after flattening the input to 2-D
+    - only when the layer has ``NVFP4 + FP8`` groups and no ``FP16`` group
+    - only when the packed tensors satisfy the current prototype constraints
+
+    All other cases fall back to the existing vLLM Marlin path.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_nvfp4: int,
+        n_fp8: int,
+        n_fp16: int,
+        k: int,
+        inv_perm: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        marlin_data: Optional[dict[str, torch.Tensor]],
+        fused_data: Optional[dict[str, torch.Tensor | float | int]],
+        w_fp16_fp16: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+
+        self.n_nvfp4 = n_nvfp4
+        self.n_fp8 = n_fp8
+        self.n_fp16 = n_fp16
+        self.N = n_nvfp4 + n_fp8 + n_fp16
+        self.K = k
+
+        self.register_buffer("inv_perm", inv_perm.to(torch.int64))
+        self.register_buffer("_inv_perm_i32", inv_perm.to(torch.int32))
+
+        if bias is not None:
+            self.bias = nn.Parameter(bias.clone())
+        else:
+            self.bias = None
+
+        self._has_marlin = marlin_data is not None
+        self._has_fused = fused_data is not None
+
+        if marlin_data is not None:
+            for name, tensor in marlin_data.items():
+                self.register_buffer(f"_{name}", tensor)
+
+        if fused_data is not None:
+            self.register_buffer("_fused_w_fp4_q", fused_data["w_fp4_q"])
+            self.register_buffer("_fused_w_fp4_scales", fused_data["w_fp4_scales"])
+            self.register_buffer("_fused_w_fp8_q", fused_data["w_fp8_q"])
+            self.register_buffer("_fused_w_fp8_scales", fused_data["w_fp8_scales"])
+            self.register_buffer(
+                "_fused_fp4_word_offsets", fused_data["fp4_word_offsets"]
+            )
+            self.register_buffer("_fused_fp4_slot_map", fused_data["fp4_slot_map"])
+            self.register_buffer(
+                "_fused_fp8_word_offsets", fused_data["fp8_word_offsets"]
+            )
+            self.register_buffer("_fused_workspace", fused_data["workspace"])
+            self.register_buffer(
+                "_fused_tile_counters", fused_data["tile_counters"]
+            )
+            self._fused_w_fp4_global_scale = float(fused_data["w_fp4_global_scale"])
+            self._fused_parallel_k = int(fused_data["parallel_k"])
+        else:
+            self._fused_w_fp4_global_scale = 1.0
+            self._fused_parallel_k = 1
+
+        if w_fp16_fp16 is not None:
+            self.register_buffer("_fp16_weight", w_fp16_fp16.half())
+
+    def _can_use_fused(self, x_2d: torch.Tensor) -> bool:
+        return self._has_fused and x_2d.is_cuda and x_2d.size(0) == 1
+
+    def _forward_fused_gemv(self, x_half: torch.Tensor) -> torch.Tensor:
+        rdquant_cuda = get_rdquant_cuda()
+        return rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_auto(
+            x_half,
+            self._fused_w_fp4_q,
+            self._fused_w_fp4_scales,
+            self._fused_w_fp4_global_scale,
+            self._fused_w_fp8_q,
+            self._fused_w_fp8_scales,
+            self._fused_fp4_word_offsets,
+            self._fused_fp4_slot_map,
+            self._fused_fp8_word_offsets,
+            self._inv_perm_i32,
+            self._fused_workspace,
+            self._fused_tile_counters,
+            self.n_nvfp4,
+            self.n_fp8,
+            self.K,
+            self._fused_parallel_k,
+        )
+
+    def _forward_marlin(self, x_half: torch.Tensor) -> torch.Tensor:
+        _ensure_vllm_path()
+        import vllm._custom_ops as ops
+        from vllm.scalar_type import scalar_types
+
+        parts: list[torch.Tensor] = []
+        m = x_half.shape[0]
+
+        if self.n_nvfp4 > 0 and hasattr(self, "_nvfp4_qweight"):
+            parts.append(
+                ops.marlin_gemm(
+                    a=x_half,
+                    c=None,
+                    b_q_weight=self._nvfp4_qweight,
+                    b_bias=None,
+                    b_scales=self._nvfp4_scales,
+                    a_scales=None,
+                    global_scale=self._nvfp4_global_scale,
+                    b_zeros=None,
+                    g_idx=None,
+                    perm=None,
+                    workspace=self._nvfp4_workspace,
+                    b_q_type=scalar_types.float4_e2m1f,
+                    size_m=m,
+                    size_n=self.n_nvfp4,
+                    size_k=self.K,
+                )
+            )
+
+        if self.n_fp8 > 0 and hasattr(self, "_fp8_qweight"):
+            parts.append(
+                ops.marlin_gemm(
+                    a=x_half,
+                    c=None,
+                    b_q_weight=self._fp8_qweight,
+                    b_bias=None,
+                    b_scales=self._fp8_scales,
+                    a_scales=None,
+                    global_scale=None,
+                    b_zeros=None,
+                    g_idx=None,
+                    perm=None,
+                    workspace=self._fp8_workspace,
+                    b_q_type=scalar_types.float8_e4m3fn,
+                    size_m=m,
+                    size_n=self.n_fp8,
+                    size_k=self.K,
+                )
+            )
+
+        if self.n_fp16 > 0 and hasattr(self, "_fp16_weight"):
+            parts.append(F.linear(x_half, self._fp16_weight))
+
+        if not parts:
+            raise RuntimeError("No Marlin or FP16 weights available for forward pass")
+
+        y_permuted = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        return y_permuted.index_select(-1, self.inv_perm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.K)
+        x_half = x_2d.half() if x_2d.dtype != torch.float16 else x_2d
+
+        if self._can_use_fused(x_2d):
+            y = self._forward_fused_gemv(x_half)
+        elif self._has_marlin and _check_vllm() and x_2d.is_cuda:
+            y = self._forward_marlin(x_half)
+        else:
+            raise RuntimeError("No compatible fused/Marlin backend available")
+
+        if self.bias is not None:
+            y = y + self.bias
+
+        y = y.to(x.dtype)
+        return y.reshape(*orig_shape[:-1], self.N)
+
+
 # ---------------------------------------------------------------------------
 #  load_for_inference
 # ---------------------------------------------------------------------------
@@ -300,6 +484,7 @@ def load_for_inference(
     model_class=None,
     device: str = "cuda",
     use_marlin: bool = True,
+    use_fused_gemv: bool = True,
 ) -> nn.Module:
     """Load a packed RDQuant checkpoint for inference.
 
@@ -315,8 +500,11 @@ def load_for_inference(
             ``AutoModelForCausalLM``.
         device: Target device (``"cuda"`` or ``"cpu"``).
         use_marlin: If True and CUDA is available, replace quantized
-            layers with :class:`MarlinMixedLinear`.  If False, materialise
+            layers with Marlin-backed modules. If False, materialise
             dequantized weights into plain ``nn.Linear``.
+        use_fused_gemv: If True, use the fused mixed-GEMV decode path on
+            eligible layers and fall back to Marlin for prefill / ineligible
+            shapes.
 
     Returns:
         The HuggingFace model ready for inference.
@@ -350,8 +538,15 @@ def load_for_inference(
         for key in f.keys():
             tensors[key] = f.get_tensor(key)
 
-    # 4. Check Marlin feasibility
-    can_marlin = use_marlin and torch.cuda.is_available() and _check_vllm()
+    # 4. Check fast-kernel feasibility
+    target_device = torch.device(device)
+    can_marlin = (
+        use_marlin
+        and target_device.type == "cuda"
+        and torch.cuda.is_available()
+        and _check_vllm()
+    )
+    can_fused = can_marlin and use_fused_gemv and fused_gemv_available()
 
     # 5. Replace each quantized layer
     for layer_name, lconf in layer_configs.items():
@@ -359,9 +554,47 @@ def load_for_inference(
         n_out = lconf["out_features"]
         splits = lconf["splits"]
         prefix = layer_name
+        layer_prefix = f"{prefix}."
+        layer_data = {
+            key[len(layer_prefix):]: value
+            for key, value in tensors.items()
+            if key.startswith(layer_prefix)
+        }
 
         # Read inv_permutation
-        inv_perm = tensors[f"{prefix}.inv_permutation"].to(torch.int64)
+        inv_perm = layer_data["inv_permutation"].to(torch.int64)
+
+        # Packed-kernel path: build directly from checkpoint tensors without
+        # materialising dequantized FP16 weights.
+        if can_marlin:
+            marlin_data = build_marlin_data(layer_data, {**splits}, n_in, target_device)
+            fused_data = (
+                pack_for_fused_gemv(layer_data, {**splits}, n_in, target_device)
+                if can_fused
+                else None
+            )
+            if marlin_data is not None:
+                bias_tensor = layer_data.get("bias", None)
+                if bias_tensor is not None:
+                    bias_tensor = bias_tensor.to(target_device)
+
+                w_fp16_buf = None
+                if splits.get("FP16", 0) > 0 and "weight_fp16" in layer_data:
+                    w_fp16_buf = layer_data["weight_fp16"].half().to(target_device)
+
+                packed_layer = FusedMixedLinear(
+                    n_nvfp4=splits.get("NVFP4", 0),
+                    n_fp8=splits.get("FP8", 0),
+                    n_fp16=splits.get("FP16", 0),
+                    k=n_in,
+                    inv_perm=inv_perm.to(target_device),
+                    bias=bias_tensor,
+                    marlin_data=marlin_data,
+                    fused_data=fused_data,
+                    w_fp16_fp16=w_fp16_buf,
+                )
+                _set_module(model, layer_name, packed_layer)
+                continue
 
         # --- Dequantize each group ---
         w_nvfp4 = None
@@ -372,11 +605,11 @@ def load_for_inference(
 
         n_nvfp4 = splits.get("NVFP4", 0)
         if n_nvfp4 > 0:
-            packed = tensors[f"{prefix}.weight_nvfp4"]  # [n_ch, K//2] uint8
-            scales_uint8 = tensors[f"{prefix}.weight_nvfp4_scale"]  # [n_ch, K//16] as uint8
+            packed = layer_data["weight_nvfp4"]  # [n_ch, K//2] uint8
+            scales_uint8 = layer_data["weight_nvfp4_scale"]  # [n_ch, K//16] as uint8
             scales_fp8 = scales_uint8.view(torch.float8_e4m3fn)
             scales_f32 = scales_fp8.to(torch.float32)  # [n_ch, K//16]
-            global_scale = tensors[f"{prefix}.nvfp4_global_scale"].item()
+            global_scale = layer_data["nvfp4_global_scale"].item()
 
             if can_marlin:
                 # For Marlin: pass packed indices + raw_scales directly
@@ -406,24 +639,22 @@ def load_for_inference(
 
         n_fp8 = splits.get("FP8", 0)
         if n_fp8 > 0:
-            data_uint8 = tensors[f"{prefix}.weight_fp8"]  # [n_ch, K] as uint8
+            data_uint8 = layer_data["weight_fp8"]  # [n_ch, K] as uint8
             data_fp8 = data_uint8.view(torch.float8_e4m3fn)
             data_f32 = data_fp8.to(torch.float32)
-            scale_vec = tensors[f"{prefix}.weight_fp8_scale"]  # [n_ch] float32
+            scale_vec = layer_data["weight_fp8_scale"]  # [n_ch] float32
             w_fp8 = (data_f32 * scale_vec.unsqueeze(1)).half()
 
         n_fp16 = splits.get("FP16", 0)
         if n_fp16 > 0:
-            data_bf16 = tensors[f"{prefix}.weight_fp16"]  # [n_ch, K] bfloat16
+            data_bf16 = layer_data["weight_fp16"]  # [n_ch, K] bfloat16
             w_fp16 = data_bf16.half()
 
         if can_marlin:
             # Build MarlinMixedLinear
-            target_device = torch.device(device)
             inv_perm_dev = inv_perm.to(target_device)
 
-            bias_key = f"{prefix}.bias"
-            bias_tensor = tensors.get(bias_key, None)
+            bias_tensor = layer_data.get("bias", None)
             if bias_tensor is not None:
                 bias_tensor = bias_tensor.to(target_device)
 
@@ -462,8 +693,7 @@ def load_for_inference(
             w_permuted = torch.cat(pieces, dim=0)  # [N_out, K] in permuted order
             w_original = w_permuted[inv_perm].to(torch.bfloat16)  # restore original channel order
 
-            bias_key = f"{prefix}.bias"
-            bias_tensor = tensors.get(bias_key, None)
+            bias_tensor = layer_data.get("bias", None)
 
             linear = nn.Linear(n_in, n_out, bias=(bias_tensor is not None))
             linear.weight = nn.Parameter(w_original)
