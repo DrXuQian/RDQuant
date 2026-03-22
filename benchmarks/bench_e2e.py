@@ -63,18 +63,38 @@ def _benchmark_model(
         truncation=True, add_special_tokens=True,
     )
     input_ids = enc["input_ids"].to(device)
+    attention_mask = enc.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, device=device)
+    else:
+        attention_mask = attention_mask.to(device)
 
     # Prefill: single forward pass on seq_len tokens
     @torch.no_grad()
     def prefill_fn():
-        model(input_ids)
+        model(input_ids, attention_mask=attention_mask, use_cache=True)
 
     prefill_ms = _cuda_timer(prefill_fn, warmup=warmup, iters=iters)
 
-    # Decode: generate 1 new token
+    # Decode: one cached autoregressive step after a prefill.
+    with torch.no_grad():
+        prefill_out = model(input_ids, attention_mask=attention_mask, use_cache=True)
+    past_key_values = prefill_out.past_key_values
+    decode_input_ids = input_ids[:, -1:].contiguous()
+    decode_attention_mask = torch.ones(
+        (input_ids.size(0), input_ids.size(1) + 1),
+        device=device,
+        dtype=attention_mask.dtype,
+    )
+
     @torch.no_grad()
     def decode_fn():
-        model.generate(input_ids, max_new_tokens=1, do_sample=False)
+        model(
+            decode_input_ids,
+            attention_mask=decode_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
 
     decode_ms = _cuda_timer(decode_fn, warmup=warmup, iters=iters)
 
