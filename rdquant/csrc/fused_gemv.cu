@@ -65,9 +65,12 @@ should_use_staged_nvfp4_splitk_variant(int n_fp4, int n_fp8, int k) {
 }
 
 __host__ __device__ __forceinline__ bool
-should_use_wide_fp8_splitk_variant(int n_fp8, int k) {
+should_use_wide_fp8_splitk_variant(int n_fp4, int n_fp8, int k) {
   (void)k;
-  return n_fp8 >= 384 && n_fp8 < 4096;
+  const int num_tiles = (n_fp4 + kBlockN - 1) / kBlockN +
+                        (n_fp8 + kBlockN - 1) / kBlockN;
+  const int num_fp8_tiles = (n_fp8 + kBlockN - 1) / kBlockN;
+  return num_tiles <= 8 && num_fp8_tiles >= 4;
 }
 
 
@@ -1285,7 +1288,7 @@ void fused_mixed_gemv_marlin_weights_splitk(
     int n_fp8,
     int k,
     int parallel_k) {
-  if (should_use_wide_fp8_splitk_variant(n_fp8, k)) {
+  if (should_use_wide_fp8_splitk_variant(n_fp4, n_fp8, k)) {
     fused_mixed_gemv_marlin_weights_splitk_wide_fp8(
         x, w_fp4_q, w_fp4_scales, w_fp4_global_scale, w_fp8_q, w_fp8_scales,
         fp4_word_offsets, fp4_slot_map, fp8_word_offsets, inv_perm, workspace,
