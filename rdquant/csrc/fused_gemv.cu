@@ -20,6 +20,8 @@
 
 #include <cstdint>
 
+#include "marlin_nvfp4_primitives.cuh"
+
 namespace {
 
 constexpr int kBlockN = 128;

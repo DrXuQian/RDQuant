@@ -18,6 +18,11 @@ if(NOT EXISTS "${CUTLASS_ROOT}/include/cutlass/cutlass.h")
     message(FATAL_ERROR "CUTLASS_ROOT is invalid: ${CUTLASS_ROOT}")
 endif()
 
+set(MARLIN_FP8_ROOT "/root/autodl-tmp/marlin/marlin_fp8")
+if(NOT EXISTS "${MARLIN_FP8_ROOT}/marlin.cuh")
+    message(FATAL_ERROR "MARLIN_FP8_ROOT is invalid: ${MARLIN_FP8_ROOT}")
+endif()
+
 # Find Python
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 
@@ -41,6 +46,7 @@ execute_process(
 include_directories(${CUTLASS_ROOT}/include)
 include_directories(${CUTLASS_ROOT}/tools/util/include)
 include_directories(${CUTLASS_ROOT}/examples/common)
+include_directories(${MARLIN_FP8_ROOT})
 
 # Build the shared library manually (avoid pybind11_add_module)
 add_library(rdquant_cuda MODULE
