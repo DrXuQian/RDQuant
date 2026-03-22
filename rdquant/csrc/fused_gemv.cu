@@ -66,11 +66,13 @@ should_use_staged_nvfp4_splitk_variant(int n_fp4, int n_fp8, int k) {
 
 __host__ __device__ __forceinline__ bool
 should_use_wide_fp8_splitk_variant(int n_fp4, int n_fp8, int k) {
-  (void)k;
   const int num_tiles = (n_fp4 + kBlockN - 1) / kBlockN +
                         (n_fp8 + kBlockN - 1) / kBlockN;
   const int num_fp8_tiles = (n_fp8 + kBlockN - 1) / kBlockN;
-  return num_tiles <= 8 && num_fp8_tiles >= 4;
+  if (num_tiles <= 8 && num_fp8_tiles >= 4) {
+    return true;
+  }
+  return num_fp8_tiles == 1 && k >= 4096;
 }
 
 

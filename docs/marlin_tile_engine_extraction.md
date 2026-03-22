@@ -199,6 +199,12 @@ Current progress on this sequence:
   `n_in_tile` with integer formulas. That removes a batch of helper-side loads
   without changing the external ABI, which is useful because the current
   kernels are constrained more by scoreboard/MIO pressure than by raw DRAM.
+- After that cleanup, the next useful work was not another structural kernel
+  rewrite but a tighter runtime policy:
+  - keep staged-NVFP4 only for the genuinely small-tile shapes
+  - allow the wide-FP8 split-K path on single-FP8-tile, large-K layers
+  This brings the default `splitk_auto` path to within about `1us` total of
+  the current per-layer `BestSK` envelope on the 7 Qwen3-4B decode shapes.
 
 ## Why FP8 First
 

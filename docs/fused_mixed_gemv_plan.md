@@ -226,14 +226,18 @@ Observed result on RTX 5090:
   from the inner loop without changing the Python/C++ interface.
 - On the latest RTX 5090 validation run after that change, the current
   best-of-available split-K path is roughly:
-  - `q_proj`: `29.3us`
-  - `k_proj`: `18.7us`
+  - `q_proj`: `28.8us`
+  - `k_proj`: `18.5us`
   - `v_proj`: `18.7us`
-  - `o_proj`: `34.7us`
-  - `gate_proj`: `45.1us`
-  - `up_proj`: `60.7us`
-  - `down_proj`: `60.4us`
-  for a total near `268us` across the 7 decode layers.
+  - `o_proj`: `34.4us`
+  - `gate_proj`: `44.8us`
+  - `up_proj`: `60.3us`
+  - `down_proj`: `59.6us`
+  for a total near `265us` across the 7 decode layers.
+- The runtime selection heuristic is also much closer to that best-of-available
+  table now. The stable `splitk_auto` path is within roughly `1us` total across
+  the 7 decode layers, which makes it reasonable to use as the default decode
+  path while deeper inner-loop work continues.
 - The split-K FP8 chunk helpers now also use explicit register staging instead
   of rebuilding the same packed-word and `x` fragment state inside each
   `16-K`/`32-K` helper call. On RTX 5090 this produces a small but repeatable
