@@ -351,6 +351,15 @@ class FusedMixedLinear(nn.Module):
         if fused_data is not None:
             self.register_buffer("_fused_w_fp4_q", fused_data["w_fp4_q"])
             self.register_buffer("_fused_w_fp4_scales", fused_data["w_fp4_scales"])
+            if "w_fp4_scales_marlin" in fused_data:
+                self.register_buffer(
+                    "_fused_w_fp4_scales_marlin", fused_data["w_fp4_scales_marlin"]
+                )
+            if "w_fp4_global_scale_marlin" in fused_data:
+                self.register_buffer(
+                    "_fused_w_fp4_global_scale_marlin",
+                    fused_data["w_fp4_global_scale_marlin"],
+                )
             self.register_buffer("_fused_w_fp8_q", fused_data["w_fp8_q"])
             self.register_buffer("_fused_w_fp8_scales", fused_data["w_fp8_scales"])
             self.register_buffer(
@@ -370,14 +379,50 @@ class FusedMixedLinear(nn.Module):
             self._fused_w_fp4_global_scale = 1.0
             self._fused_parallel_k = 1
 
+        try:
+            rdquant_cuda = get_rdquant_cuda()
+            self._has_fused_nvfp4_marlin = (
+                fused_data is not None
+                and hasattr(self, "_fused_w_fp4_scales_marlin")
+                and hasattr(self, "_fused_w_fp4_global_scale_marlin")
+                and hasattr(
+                    rdquant_cuda,
+                    "fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin",
+                )
+            )
+        except Exception:
+            self._has_fused_nvfp4_marlin = False
+
         if w_fp16_fp16 is not None:
             self.register_buffer("_fp16_weight", w_fp16_fp16.half())
 
     def _can_use_fused(self, x_2d: torch.Tensor) -> bool:
         return self._has_fused and x_2d.is_cuda and x_2d.size(0) == 1
 
+    def _should_use_nvfp4_marlin_fused_lane(self) -> bool:
+        return self._has_fused_nvfp4_marlin and self.n_nvfp4 >= 512
+
     def _forward_fused_gemv(self, x_half: torch.Tensor) -> torch.Tensor:
         rdquant_cuda = get_rdquant_cuda()
+        if self._should_use_nvfp4_marlin_fused_lane():
+            return rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_nvfp4_marlin(
+                x_half,
+                self._fused_w_fp4_q,
+                self._fused_w_fp4_scales_marlin,
+                self._fused_w_fp4_global_scale_marlin,
+                self._fused_w_fp8_q,
+                self._fused_w_fp8_scales,
+                self._fused_fp4_word_offsets,
+                self._fused_fp4_slot_map,
+                self._fused_fp8_word_offsets,
+                self._inv_perm_i32,
+                self._fused_workspace,
+                self._fused_tile_counters,
+                self.n_nvfp4,
+                self.n_fp8,
+                self.K,
+                self._fused_parallel_k,
+            )
         return rdquant_cuda.fused_mixed_gemv_marlin_weights_splitk_auto(
             x_half,
             self._fused_w_fp4_q,

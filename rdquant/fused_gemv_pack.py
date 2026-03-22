@@ -312,6 +312,18 @@ def pack_for_fused_gemv(
     w_fp8_raw = layer_data["weight_fp8"].to(
         device=device, dtype=torch.uint8
     ).contiguous()
+    w_fp4_scales_raw = layer_data["weight_nvfp4_scale"].to(
+        device=device, dtype=torch.uint8
+    ).contiguous()
+    (
+        w_fp4_scales_marlin,
+        w_fp4_global_scale_marlin,
+    ) = prepare_marlin_nvfp4_scales(
+        w_fp4_scales_raw,
+        float(layer_data["nvfp4_global_scale"].item()),
+        k,
+        n_fp4,
+    )
 
     fp4_word_offsets, fp4_slot_map, fp8_word_offsets = make_marlin_group_maps(device)
     n_total = n_fp4 + n_fp8
@@ -319,10 +331,10 @@ def pack_for_fused_gemv(
 
     return {
         "w_fp4_q": pack_fp4_to_marlin_qweight(w_fp4_packed),
-        "w_fp4_scales": layer_data["weight_nvfp4_scale"].to(
-            device=device, dtype=torch.uint8
-        ).contiguous(),
+        "w_fp4_scales": w_fp4_scales_raw,
         "w_fp4_global_scale": float(layer_data["nvfp4_global_scale"].item()),
+        "w_fp4_scales_marlin": w_fp4_scales_marlin,
+        "w_fp4_global_scale_marlin": w_fp4_global_scale_marlin,
         "w_fp8_q": pack_fp8_to_marlin_qweight(w_fp8_raw),
         "w_fp8_scales": layer_data["weight_fp8_scale"].to(
             device=device, dtype=torch.float32
