@@ -124,8 +124,26 @@ def save_packed(model: "QuantizedModel", path: str, source_model_dir: str | None
             "avg_bits": qw.avg_bits,
         }
 
+    # Also save non-quantized parameters (embed, lm_head, norms, etc.)
+    from rdquant.quantize import QuantizedLayer
+    n_extra = 0
+    for pname, param in model.model.named_parameters():
+        # Skip if already saved as part of a QuantizedLayer
+        is_quant = any(pname.startswith(ln + ".") for ln in layer_configs)
+        if not is_quant and pname not in tensors:
+            tensors[pname] = param.data.to(torch.float16).contiguous()
+            n_extra += 1
+    for bname, buf in model.model.named_buffers():
+        is_quant = any(bname.startswith(ln + ".") for ln in layer_configs)
+        if not is_quant and bname not in tensors:
+            tensors[bname] = buf.contiguous()
+            n_extra += 1
+
     # Save tensors as safetensors
     save_file(tensors, os.path.join(path, "model.safetensors"))
+    total_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+    print(f"Saved {len(layer_configs)} quantized layers + {n_extra} non-quantized params")
+    print(f"  model.safetensors: {total_bytes / 1e9:.2f} GB")
 
     # Save quantization config
     config = {

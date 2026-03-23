@@ -924,7 +924,26 @@ def load_for_inference(
 
             _set_module(model, layer_name, linear)
 
-    # 6. Move non-quantized parameters to device
+    # 6. Fill non-quantized parameters from checkpoint (embed, norm, lm_head)
+    quant_layers = set(layer_configs.keys())
+    filled = 0
+    for pname, param in model.named_parameters():
+        is_quant = any(pname.startswith(ql + ".") for ql in quant_layers)
+        if not is_quant and pname in tensors:
+            param.data.copy_(tensors[pname].to(param.dtype))
+            filled += 1
+    for bname, buf in model.named_buffers():
+        is_quant = any(bname.startswith(ql + ".") for ql in quant_layers)
+        if not is_quant and bname in tensors:
+            buf.copy_(tensors[bname].to(buf.dtype))
+            filled += 1
+
+    # Restore weight tying (to_empty breaks it)
+    if getattr(config, "tie_word_embeddings", False):
+        if hasattr(model, "lm_head") and hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+            model.lm_head.weight = model.model.embed_tokens.weight
+
+    # 7. Move to device
     model = model.to(device)
     model.eval()
     return model
