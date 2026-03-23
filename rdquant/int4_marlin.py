@@ -175,9 +175,20 @@ def _choose_uint4_parallel_k(n_combined: int, k: int) -> int:
     return min(parallel_k, 16)
 
 
-def _should_use_nonpersistent_uint4(m: int) -> bool:
-    """Use the fused UINT4 lane for decode and lightly batched decode."""
-    return m <= 4
+def _should_use_nonpersistent_uint4(m: int, n_combined: int, k: int) -> bool:
+    """Use the fused UINT4 lane for decode and small-batch decode.
+
+    The non-persistent path is broadly beneficial at very small batch sizes,
+    but larger mixed layers cross over quickly as M grows.  Very small layers
+    remain a good fit well beyond decode.
+    """
+    if n_combined <= 1024 and m <= 64:
+        return True
+    if m <= 2:
+        return True
+    if m <= 4 and k <= 4096 and (n_combined <= 3072 or k <= 3072):
+        return True
+    return False
 
 
 class Int4MarlinLinear(nn.Module):
@@ -259,7 +270,8 @@ class Int4MarlinLinear(nn.Module):
 
     def _forward_fused(self, x_2d, M, orig_dtype, orig_shape):
         """Forward with fused pre/post-processing CUDA kernels (v2)."""
-        if self.use_nonpersistent_gemv and _should_use_nonpersistent_uint4(M):
+        if self.use_nonpersistent_gemv and _should_use_nonpersistent_uint4(
+            M, self.N_combined, self.K):
             inv_awq = self.inv_awq_scales if self.inv_awq_scales is not None else x_2d.new_empty(0)
             y_out = self._fused.fused_uint4_decode(
                 x_2d, inv_awq,
