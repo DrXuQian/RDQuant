@@ -254,6 +254,19 @@ class Int4MarlinLinear(nn.Module):
 
     def _forward_fused(self, x_2d, M, orig_dtype, orig_shape):
         """Forward with fused pre/post-processing CUDA kernels (v2)."""
+        if self.use_nonpersistent_gemv and M == 1:
+            inv_awq = self.inv_awq_scales if self.inv_awq_scales is not None else x_2d.new_empty(0)
+            y_out = self._fused.fused_uint4_decode(
+                x_2d, inv_awq,
+                self.uint4_packed_rowwise, self.uint4_scales_rowwise,
+                self.int8_correction, self.inv_perm,
+                self.N_int4, self.N_int8,
+                self.group_size, self.uint4_parallel_k,
+            )
+            if self.bias is not None:
+                y_out = y_out + self.bias
+            return y_out.to(orig_dtype).reshape(*orig_shape[:-1], self.N_total)
+
         # Fused pre: in-place AWQ scaling (x *= 1/α) + sum_x — one kernel
         if self.inv_awq_scales is not None:
             x_2d = x_2d.contiguous()   # ensure contiguous for in-place
@@ -261,23 +274,17 @@ class Int4MarlinLinear(nn.Module):
         else:
             sum_x = self._fused.fused_sum_only(x_2d)
 
-        if self.use_nonpersistent_gemv and M == 1:
-            y = self._fused.fused_uint4_gemv(
-                x_2d, self.uint4_packed_rowwise, self.uint4_scales_rowwise,
-                self.group_size, self.uint4_parallel_k,
-            )
-        else:
-            y = ops.marlin_gemm(
-                a=x_2d, c=None,
-                b_q_weight=self.marlin_qweight, b_bias=None,
-                b_scales=self.marlin_scales,
-                a_scales=None, global_scale=None,
-                b_zeros=self.zp, g_idx=self.g_idx,
-                perm=self.sort_indices, workspace=self.workspace,
-                b_q_type=scalar_types.uint4b8,
-                size_m=M, size_n=self.N_combined, size_k=self.K,
-                is_k_full=True,
-            )
+        y = ops.marlin_gemm(
+            a=x_2d, c=None,
+            b_q_weight=self.marlin_qweight, b_bias=None,
+            b_scales=self.marlin_scales,
+            a_scales=None, global_scale=None,
+            b_zeros=self.zp, g_idx=self.g_idx,
+            perm=self.sort_indices, workspace=self.workspace,
+            b_q_type=scalar_types.uint4b8,
+            size_m=M, size_n=self.N_combined, size_k=self.K,
+            is_k_full=True,
+        )
 
         # Fused post: INT8 correction + inv_perm reorder in one kernel
         y_out = self._fused.fused_post(
