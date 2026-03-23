@@ -11,6 +11,132 @@
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 
+namespace {
+
+constexpr int kUint4GroupSize = 128;
+constexpr int kUint4Threads = 128;
+constexpr int kUint4Pack = 8;
+
+__device__ __forceinline__ float unpack_uint4_dot8(
+    int32_t packed_word,
+    const half* __restrict__ x_chunk,
+    float scale)
+{
+    float acc = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kUint4Pack; ++i) {
+        int q = (packed_word >> (4 * i)) & 0xF;
+        acc += (static_cast<float>(q) - 8.0f) *
+               __half2float(x_chunk[i]) * scale;
+    }
+    return acc;
+}
+
+__global__ void fused_uint4_groupwise_gemv_kernel(
+    const half* __restrict__ x,              // [M, K]
+    const int32_t* __restrict__ w_packed,    // [N, K/8]
+    const half* __restrict__ w_scales,       // [N, K/group_size]
+    half* __restrict__ y,                    // [M, N]
+    int M,
+    int N,
+    int K,
+    int n_groups)
+{
+    __shared__ half sh_x[kUint4GroupSize];
+
+    const int m = blockIdx.y;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int words_per_group = kUint4GroupSize / kUint4Pack;
+    const int words_per_row = K / kUint4Pack;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < n_groups; ++g) {
+        const int k0 = g * kUint4GroupSize;
+        sh_x[threadIdx.x] = x[m * K + k0 + threadIdx.x];
+        __syncthreads();
+
+        if (n < N) {
+            const float scale = __half2float(w_scales[n * n_groups + g]);
+            const int32_t* row_words =
+                w_packed + n * words_per_row + g * words_per_group;
+#pragma unroll
+            for (int word_idx = 0; word_idx < words_per_group; ++word_idx) {
+                acc += unpack_uint4_dot8(
+                    row_words[word_idx], sh_x + word_idx * kUint4Pack, scale);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (n < N) {
+        y[m * N + n] = __float2half(acc);
+    }
+}
+
+__global__ void fused_uint4_groupwise_gemv_splitk_kernel(
+    const half* __restrict__ x,              // [M, K]
+    const int32_t* __restrict__ w_packed,    // [N, K/8]
+    const half* __restrict__ w_scales,       // [N, K/group_size]
+    float* __restrict__ workspace,           // [M, N]
+    int M,
+    int N,
+    int K,
+    int n_groups,
+    int parallel_k)
+{
+    __shared__ half sh_x[kUint4GroupSize];
+
+    const int m = blockIdx.y;
+    const int slice = blockIdx.z;
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int words_per_group = kUint4GroupSize / kUint4Pack;
+    const int words_per_row = K / kUint4Pack;
+    const int groups_per_slice = (n_groups + parallel_k - 1) / parallel_k;
+    const int g_begin = slice * groups_per_slice;
+    const int g_end = min(n_groups, g_begin + groups_per_slice);
+
+    if (g_begin >= g_end) {
+        return;
+    }
+
+    float acc = 0.0f;
+    for (int g = g_begin; g < g_end; ++g) {
+        const int k0 = g * kUint4GroupSize;
+        sh_x[threadIdx.x] = x[m * K + k0 + threadIdx.x];
+        __syncthreads();
+
+        if (n < N) {
+            const float scale = __half2float(w_scales[n * n_groups + g]);
+            const int32_t* row_words =
+                w_packed + n * words_per_row + g * words_per_group;
+#pragma unroll
+            for (int word_idx = 0; word_idx < words_per_group; ++word_idx) {
+                acc += unpack_uint4_dot8(
+                    row_words[word_idx], sh_x + word_idx * kUint4Pack, scale);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (n < N) {
+        atomicAdd(&workspace[m * N + n], acc);
+    }
+}
+
+__global__ void fused_uint4_finalize_kernel(
+    const float* __restrict__ workspace,
+    half* __restrict__ y,
+    int total)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        y[idx] = __float2half(workspace[idx]);
+    }
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // Pre-kernel v2: in-place AWQ scaling + sum_x, vectorized half2
 // ---------------------------------------------------------------------------
@@ -302,9 +428,78 @@ torch::Tensor fused_post_v2(
 }
 
 
+torch::Tensor fused_uint4_groupwise_gemv(
+    torch::Tensor x,           // [M, K] half
+    torch::Tensor w_packed,    // [N, K/8] int32
+    torch::Tensor w_scales,    // [N, K/group_size] half
+    int group_size,
+    int parallel_k)
+{
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
+    TORCH_CHECK(w_packed.is_cuda(), "w_packed must be CUDA");
+    TORCH_CHECK(w_scales.is_cuda(), "w_scales must be CUDA");
+    TORCH_CHECK(x.dtype() == torch::kFloat16, "x must be float16");
+    TORCH_CHECK(w_packed.dtype() == torch::kInt32, "w_packed must be int32");
+    TORCH_CHECK(w_scales.dtype() == torch::kFloat16, "w_scales must be float16");
+    TORCH_CHECK(x.dim() == 2, "x must be [M, K]");
+    TORCH_CHECK(w_packed.dim() == 2, "w_packed must be [N, K/8]");
+    TORCH_CHECK(w_scales.dim() == 2, "w_scales must be [N, K/group_size]");
+    TORCH_CHECK(group_size == kUint4GroupSize,
+                "fused_uint4_groupwise_gemv currently requires group_size=128");
+
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int N = w_packed.size(0);
+    const int n_groups = K / group_size;
+
+    TORCH_CHECK(K % kUint4Pack == 0, "K must be divisible by 8");
+    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
+    TORCH_CHECK(w_packed.size(1) == K / kUint4Pack,
+                "w_packed must have shape [N, K/8]");
+    TORCH_CHECK(w_scales.size(0) == N && w_scales.size(1) == n_groups,
+                "w_scales must have shape [N, K/group_size]");
+
+    auto y = torch::empty({M, N}, x.options());
+    const dim3 block(kUint4Threads);
+    const dim3 grid((N + kUint4Threads - 1) / kUint4Threads, M);
+
+    if (parallel_k <= 1) {
+        fused_uint4_groupwise_gemv_kernel<<<grid, block>>>(
+            reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+            w_packed.data_ptr<int32_t>(),
+            reinterpret_cast<const half*>(w_scales.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+            M, N, K, n_groups);
+    } else {
+        auto workspace = torch::zeros({M, N}, x.options().dtype(torch::kFloat32));
+        const dim3 splitk_grid((N + kUint4Threads - 1) / kUint4Threads, M,
+                               parallel_k);
+        fused_uint4_groupwise_gemv_splitk_kernel<<<splitk_grid, block>>>(
+            reinterpret_cast<const half*>(x.data_ptr<at::Half>()),
+            w_packed.data_ptr<int32_t>(),
+            reinterpret_cast<const half*>(w_scales.data_ptr<at::Half>()),
+            workspace.data_ptr<float>(),
+            M, N, K, n_groups, parallel_k);
+
+        const int total = M * N;
+        const int finalize_threads = 256;
+        const int finalize_blocks = (total + finalize_threads - 1) /
+                                    finalize_threads;
+        fused_uint4_finalize_kernel<<<finalize_blocks, finalize_threads>>>(
+            workspace.data_ptr<float>(),
+            reinterpret_cast<half*>(y.data_ptr<at::Half>()),
+            total);
+    }
+
+    return y;
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // v1 (kept for backwards compat)
     m.def("fused_awq_sum", &fused_awq_sum_v2, "Fused AWQ scaling + sum_x (v2, in-place, half2)");
     m.def("fused_sum_only", &fused_sum_only_v2, "Fused sum_x (v2, half2)");
     m.def("fused_post", &fused_post_v2, "Fused correction + reorder (v2, shmem, int32)");
+    m.def("fused_uint4_gemv", &fused_uint4_groupwise_gemv,
+          "Non-persistent UINT4 groupwise GEMV (row-major packed)");
 }

@@ -78,8 +78,11 @@ def pack_for_marlin(
 ) -> dict[str, torch.Tensor]:
     """Offline packing for the single-Marlin mixed-precision kernel.
 
-    Returns dict with keys: marlin_qweight, marlin_scales, int8_correction,
-    N_int4, N_int8, K, N_combined.
+    Returns dict with keys:
+      - marlin_qweight / marlin_scales for the persistent Marlin fallback
+      - uint4_packed_rowwise / uint4_scales_rowwise for the non-persistent
+        decode GEMV path
+      - int8_correction, N_int4, N_int8, K, N_combined
     """
     N_int4, K = w_int4_uint4.shape
     N_int8 = w_int8.shape[0]
@@ -125,6 +128,8 @@ def pack_for_marlin(
     return dict(
         marlin_qweight=marlin_qweight,
         marlin_scales=marlin_scales,
+        uint4_packed_rowwise=w_int32.contiguous(),
+        uint4_scales_rowwise=scales_combined.T.to(torch.half).to(device).contiguous(),
         int8_correction=int8_correction,
         N_int4=N_int4,
         N_int8=N_int8,
@@ -152,6 +157,24 @@ def _load_fused_kernels():
     return _load_fused_kernels._module
 
 
+def _choose_uint4_parallel_k(n_combined: int, k: int) -> int:
+    """Heuristic for the non-persistent UINT4 decode kernel.
+
+    Larger-K / smaller-N shapes need extra K-parallelism to keep enough CTAs
+    in flight; smaller K benefits more from keeping the path single-kernel.
+    """
+    parallel_k = 1
+    if k >= 2048:
+        parallel_k = 2
+    if k >= 4096:
+        parallel_k = 4
+    if k >= 8192:
+        parallel_k = 8
+    if n_combined >= 6144 and k >= 2048:
+        parallel_k *= 2
+    return min(parallel_k, 16)
+
+
 class Int4MarlinLinear(nn.Module):
     """Single-Marlin-launch mixed INT4/INT8 linear layer."""
 
@@ -166,6 +189,7 @@ class Int4MarlinLinear(nn.Module):
         group_size: int = 128,
         awq_scales: Optional[torch.Tensor] = None,  # [K] float32
         use_fused: bool = True,
+        use_nonpersistent_gemv: bool = True,
     ):
         super().__init__()
 
@@ -182,9 +206,13 @@ class Int4MarlinLinear(nn.Module):
         self.K = packed["K"]
         self.group_size = group_size
         self.use_fused = use_fused
+        self.use_nonpersistent_gemv = use_nonpersistent_gemv
+        self.uint4_parallel_k = _choose_uint4_parallel_k(self.N_combined, self.K)
 
         self.register_buffer("marlin_qweight", packed["marlin_qweight"])
         self.register_buffer("marlin_scales", packed["marlin_scales"])
+        self.register_buffer("uint4_packed_rowwise", packed["uint4_packed_rowwise"])
+        self.register_buffer("uint4_scales_rowwise", packed["uint4_scales_rowwise"])
         self.register_buffer("int8_correction", packed["int8_correction"])
         # int32 perm for v2 fused kernel (halves bandwidth vs int64)
         self.register_buffer("inv_perm", inv_perm.to(torch.int32).to(device))
@@ -233,18 +261,23 @@ class Int4MarlinLinear(nn.Module):
         else:
             sum_x = self._fused.fused_sum_only(x_2d)
 
-        # Single Marlin GEMM
-        y = ops.marlin_gemm(
-            a=x_2d, c=None,
-            b_q_weight=self.marlin_qweight, b_bias=None,
-            b_scales=self.marlin_scales,
-            a_scales=None, global_scale=None,
-            b_zeros=self.zp, g_idx=self.g_idx,
-            perm=self.sort_indices, workspace=self.workspace,
-            b_q_type=scalar_types.uint4b8,
-            size_m=M, size_n=self.N_combined, size_k=self.K,
-            is_k_full=True,
-        )
+        if self.use_nonpersistent_gemv and M == 1:
+            y = self._fused.fused_uint4_gemv(
+                x_2d, self.uint4_packed_rowwise, self.uint4_scales_rowwise,
+                self.group_size, self.uint4_parallel_k,
+            )
+        else:
+            y = ops.marlin_gemm(
+                a=x_2d, c=None,
+                b_q_weight=self.marlin_qweight, b_bias=None,
+                b_scales=self.marlin_scales,
+                a_scales=None, global_scale=None,
+                b_zeros=self.zp, g_idx=self.g_idx,
+                perm=self.sort_indices, workspace=self.workspace,
+                b_q_type=scalar_types.uint4b8,
+                size_m=M, size_n=self.N_combined, size_k=self.K,
+                is_k_full=True,
+            )
 
         # Fused post: INT8 correction + inv_perm reorder in one kernel
         y_out = self._fused.fused_post(
@@ -398,7 +431,7 @@ def test_correctness_suite():
 
 def benchmark(M=1, N_int4=2048, N_int8=2048, K=4096, group_size=128,
               warmup=50, iters=200):
-    """Benchmark: single Marlin vs 2x Marlin vs BF16 cuBLAS."""
+    """Benchmark: non-persistent UINT4 GEMV vs persistent Marlin vs baselines."""
     torch.manual_seed(0)
     device = "cuda"
 
@@ -415,20 +448,27 @@ def benchmark(M=1, N_int4=2048, N_int8=2048, K=4096, group_size=128,
 
     x = torch.randn(M, K, device=device, dtype=torch.half)
 
-    # --- Single Marlin (our method) ---
-    layer = Int4MarlinLinear(
-        w_int4_uint4, s_int4, w_int8, s_int8, inv_perm, group_size=group_size,
+    layer_new = Int4MarlinLinear(
+        w_int4_uint4, s_int4, w_int8, s_int8, inv_perm,
+        group_size=group_size, use_nonpersistent_gemv=True,
+    )
+    layer_old = Int4MarlinLinear(
+        w_int4_uint4, s_int4, w_int8, s_int8, inv_perm,
+        group_size=group_size, use_nonpersistent_gemv=False,
     )
 
-    for _ in range(warmup):
-        layer(x)
-    torch.cuda.synchronize()
+    def _time_layer(mod):
+        for _ in range(warmup):
+            mod(x)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            mod(x)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / iters * 1000
 
-    t0 = time.perf_counter()
-    for _ in range(iters):
-        layer(x)
-    torch.cuda.synchronize()
-    single_ms = (time.perf_counter() - t0) / iters * 1000
+    new_ms = _time_layer(layer_new)
+    old_ms = _time_layer(layer_old)
 
     # --- 2x Marlin (separate INT4 + INT8-as-INT4 calls) ---
     # Pack INT4 part separately
@@ -506,11 +546,13 @@ def benchmark(M=1, N_int4=2048, N_int8=2048, K=4096, group_size=128,
     bf16_ms = (time.perf_counter() - t0) / iters * 1000
 
     print(f"Benchmark  M={M}  N_total={N_total}  K={K}")
-    print(f"  1x Marlin (fused):   {single_ms:.4f} ms")
+    print(f"  New UINT4 GEMV:      {new_ms:.4f} ms")
+    print(f"  1x Marlin (old):     {old_ms:.4f} ms")
     print(f"  2x Marlin (split):   {two_ms:.4f} ms")
     print(f"  BF16 cuBLAS:         {bf16_ms:.4f} ms")
-    print(f"  Speedup fused/split: {two_ms/single_ms:.2f}x")
-    print(f"  Speedup fused/BF16:  {bf16_ms/single_ms:.2f}x")
+    print(f"  Speedup new/old:     {old_ms/new_ms:.2f}x")
+    print(f"  Speedup new/split:   {two_ms/new_ms:.2f}x")
+    print(f"  Speedup new/BF16:    {bf16_ms/new_ms:.2f}x")
 
 
 if __name__ == "__main__":
