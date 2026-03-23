@@ -202,3 +202,131 @@ def load_packed_int4(
         setattr(parent, parts[-1], qlayer)
 
     return model
+
+
+def load_for_inference_int4(
+    path: str,
+    device: str = "cuda",
+    use_marlin: bool = True,
+) -> torch.nn.Module:
+    """Load packed INT4/INT8 checkpoint with Marlin kernels for fast inference.
+
+    Pipeline: safetensors → Int4FusedLinear → Int4MarlinLinear (single Marlin kernel).
+
+    Args:
+        path: Directory with model.safetensors + quantization_config.json.
+        device: Target device.
+        use_marlin: If True, convert to Int4MarlinLinear for Marlin inference.
+            If False, keep Int4FusedLinear (fake-quant, slower but no vLLM needed).
+
+    Returns:
+        Model ready for inference.
+    """
+    from safetensors.torch import load_file
+    from rdquant.int4_fusion import Int4FusedLinear
+
+    # Load config
+    with open(os.path.join(path, "quantization_config.json")) as f:
+        qconfig = json.load(f)
+
+    # Load all tensors
+    tensors = load_file(os.path.join(path, "model.safetensors"), device="cpu")
+
+    # Load HF model architecture (empty weights)
+    from transformers import AutoModelForCausalLM, AutoConfig
+    config = AutoConfig.from_pretrained(path, trust_remote_code=True)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    model = model.to_empty(device="cpu")
+    model.eval()
+
+    # Fill non-quantized parameters (embed, norm, lm_head)
+    quant_layers = set(qconfig["layers"].keys())
+    filled = 0
+    for pname, param in model.named_parameters():
+        is_quant = any(pname.startswith(ql + ".") for ql in quant_layers)
+        if not is_quant and pname in tensors:
+            param.data.copy_(tensors[pname].to(param.dtype))
+            filled += 1
+    for bname, buf in model.named_buffers():
+        is_quant = any(bname.startswith(ql + ".") for ql in quant_layers)
+        if not is_quant and bname in tensors:
+            buf.copy_(tensors[bname].to(buf.dtype))
+            filled += 1
+
+    # Restore weight tying (to_empty breaks it)
+    if getattr(config, "tie_word_embeddings", False):
+        if hasattr(model, "lm_head") and hasattr(model.model, "embed_tokens"):
+            model.lm_head.weight = model.model.embed_tokens.weight
+            filled += 1
+
+    print(f"  Filled {filled} non-quantized parameters")
+
+    # Replace quantized layers with Int4FusedLinear
+    for name, lcfg in qconfig["layers"].items():
+        prefix = name
+        w_int4 = tensors[f"{prefix}.weight_int4"]
+        s_int4 = tensors[f"{prefix}.scale_int4"].float()
+        w_int8 = tensors[f"{prefix}.weight_int8"]
+        s_int8 = tensors[f"{prefix}.scale_int8"].float()
+        inv_perm = tensors[f"{prefix}.inv_perm"].long()
+
+        awq = tensors.get(f"{prefix}.awq_scales")
+        if awq is not None:
+            awq = awq.float()
+        bias = tensors.get(f"{prefix}.bias")
+        if bias is not None:
+            bias = bias.float()
+
+        qlayer = Int4FusedLinear(
+            w_int4=w_int4, s_int4=s_int4,
+            w_int8=w_int8, s_int8=s_int8,
+            inv_perm=inv_perm, bias=bias,
+            group_size=lcfg["group_size"], awq_scales=awq,
+        )
+
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        setattr(parent, parts[-1], qlayer)
+
+    # Convert to Marlin if requested
+    if use_marlin and device == "cuda" and torch.cuda.is_available():
+        from rdquant.int4_marlin import Int4MarlinLinear
+
+        model.to(device)
+        converted = 0
+        for name, module in list(model.named_modules()):
+            if isinstance(module, Int4FusedLinear):
+                w_int4 = module.w_int4_raw.cpu()
+                s_int4 = module.s_int4_raw.cpu()
+                w_int8 = module.w_int8_raw.cpu()
+                s_int8 = module.s_int8_raw.cpu()
+                inv_perm = module.inv_perm.cpu()
+                group_size = module.group_size
+
+                w_int4_uint4 = (w_int4.to(torch.int16) + 8).to(torch.uint8)
+                awq = module.awq_scales.cpu().float() if module.awq_scales is not None else None
+                bias = module.bias.data.cpu() if module.bias is not None else None
+
+                marlin_layer = Int4MarlinLinear(
+                    w_int4_uint4=w_int4_uint4, s_int4=s_int4,
+                    w_int8=w_int8, s_int8=s_int8,
+                    inv_perm=inv_perm, bias=bias,
+                    group_size=group_size, awq_scales=awq,
+                )
+
+                parts = name.split(".")
+                parent = model
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, parts[-1], marlin_layer)
+                converted += 1
+
+        print(f"Loaded {converted} Int4MarlinLinear layers (single Marlin kernel)")
+    else:
+        model.to(device)
+        print(f"Loaded {len(qconfig['layers'])} Int4FusedLinear layers (fake-quant)")
+
+    return model
