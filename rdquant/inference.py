@@ -11,7 +11,8 @@ Provides two one-click interfaces:
 Also defines :class:`MarlinMixedLinear`, a drop-in ``nn.Module`` that runs
 two Marlin GEMMs (NVFP4 + FP8) and concatenates/permutes the results, plus
 ``FusedMixedLinear`` which uses the fused mixed-GEMV CUDA path for decode
-(``M == 1``) and falls back to Marlin for larger batches / prefill.
+(``M == 1``) and can optionally use a dense materialized prefill path for
+larger batches.
 
 vLLM dependency is **conditional**: Marlin mode requires vLLM custom ops,
 but fake-quant mode works without it.
@@ -63,6 +64,79 @@ def _check_vllm() -> bool:
     return _vllm_available
 
 
+def _materialize_packed_groups(
+    layer_data: dict[str, torch.Tensor],
+    splits: dict[str, int],
+    n_in: int,
+) -> dict[str, Optional[torch.Tensor]]:
+    """Materialize packed checkpoint groups into dequantized FP16 tensors."""
+    w_nvfp4 = None
+    w_fp8 = None
+    w_fp16 = None
+    raw_nvfp4_scales = None
+    nvfp4_packed_indices = None
+
+    n_nvfp4 = splits.get("NVFP4", 0)
+    if n_nvfp4 > 0:
+        packed = layer_data["weight_nvfp4"]
+        scales_uint8 = layer_data["weight_nvfp4_scale"]
+        scales_f32 = scales_uint8.view(torch.float8_e4m3fn).to(torch.float32)
+        nvfp4_packed_indices = packed
+        raw_nvfp4_scales = scales_f32
+
+        even = (packed & 0x0F).to(torch.int64)
+        odd = ((packed >> 4) & 0x0F).to(torch.int64)
+        n_ch = packed.shape[0]
+        half_k = packed.shape[1]
+        indices_2d = torch.empty(n_ch, half_k * 2, dtype=torch.int64)
+        indices_2d[:, 0::2] = even
+        indices_2d[:, 1::2] = odd
+
+        from rdquant.core.formats import _NVFP4_LUT, _NVFP4_BLOCK_SIZE
+
+        values = _NVFP4_LUT[indices_2d.reshape(-1)].reshape(n_ch, n_in)
+        blocks_per_row = n_in // _NVFP4_BLOCK_SIZE
+        scales_expanded = scales_f32.unsqueeze(-1).expand(
+            n_ch, blocks_per_row, _NVFP4_BLOCK_SIZE
+        ).reshape(n_ch, n_in)
+        w_nvfp4 = (values * scales_expanded).half()
+
+    n_fp8 = splits.get("FP8", 0)
+    if n_fp8 > 0:
+        data_uint8 = layer_data["weight_fp8"]
+        data_f32 = data_uint8.view(torch.float8_e4m3fn).to(torch.float32)
+        scale_vec = layer_data["weight_fp8_scale"]
+        w_fp8 = (data_f32 * scale_vec.unsqueeze(1)).half()
+
+    n_fp16 = splits.get("FP16", 0)
+    if n_fp16 > 0:
+        w_fp16 = layer_data["weight_fp16"].half()
+
+    return {
+        "w_nvfp4": w_nvfp4,
+        "w_fp8": w_fp8,
+        "w_fp16": w_fp16,
+        "raw_nvfp4_scales": raw_nvfp4_scales,
+        "nvfp4_packed_indices": nvfp4_packed_indices,
+    }
+
+
+def _normalize_torch_dtype(dtype_like) -> torch.dtype:
+    if isinstance(dtype_like, torch.dtype):
+        return dtype_like
+    if isinstance(dtype_like, str):
+        mapping = {
+            "float16": torch.float16,
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        return mapping.get(dtype_like.lower(), torch.bfloat16)
+    return torch.bfloat16
+
+
 # ---------------------------------------------------------------------------
 #  MarlinMixedLinear — real Marlin kernel execution
 # ---------------------------------------------------------------------------
@@ -95,6 +169,7 @@ class MarlinMixedLinear(nn.Module):
         bias: Optional[torch.Tensor],
         raw_nvfp4_scales: Optional[torch.Tensor] = None,
         nvfp4_packed_indices: Optional[torch.Tensor] = None,
+        w_prefill_fp16: Optional[torch.Tensor] = None,
     ):
         super().__init__()
 
@@ -133,6 +208,9 @@ class MarlinMixedLinear(nn.Module):
             self.bias = nn.Parameter(bias.clone())
         else:
             self.bias = None
+
+        if w_prefill_fp16 is not None:
+            self.register_buffer("_prefill_weight", w_prefill_fp16.to(device))
 
         self._scalar_type_nvfp4 = scalar_types.float4_e2m1f
 
@@ -238,6 +316,18 @@ class MarlinMixedLinear(nn.Module):
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.K)
         M = x_2d.shape[0]
+        if M > 1 and hasattr(self, "_prefill_weight"):
+            x_prefill = (
+                x_2d
+                if x_2d.dtype == self._prefill_weight.dtype
+                else x_2d.to(self._prefill_weight.dtype)
+            )
+            y = F.linear(x_prefill, self._prefill_weight)
+            if self.bias is not None:
+                y = y + self.bias
+            y = y.to(x.dtype)
+            return y.reshape(*orig_shape[:-1], self.N)
+
         x_half = x_2d.half() if x_2d.dtype != torch.float16 else x_2d
 
         parts = []
@@ -266,6 +356,7 @@ class MarlinMixedLinear(nn.Module):
         # FP8 group
         if self.n_fp8 > 0:
             from vllm.scalar_type import scalar_types
+
             y_fp8 = ops.marlin_gemm(
                 a=x_half,
                 c=None,
@@ -301,7 +392,7 @@ class MarlinMixedLinear(nn.Module):
 
 
 class FusedMixedLinear(nn.Module):
-    """Packed mixed linear with fused decode GEMV and Marlin fallback.
+    """Packed mixed linear with fused decode GEMV and optional dense prefill.
 
     The decode fast path currently targets the stable fused split-K kernel:
 
@@ -309,7 +400,9 @@ class FusedMixedLinear(nn.Module):
     - only when the layer has ``NVFP4 + FP8`` groups and no ``FP16`` group
     - only when the packed tensors satisfy the current prototype constraints
 
-    All other cases fall back to the existing vLLM Marlin path.
+    For ``M > 1`` the preferred prefill path is a single dense ``F.linear``
+    over a materialized FP16 weight matrix when available. Otherwise the layer
+    falls back to the existing grouped Marlin path.
     """
 
     def __init__(
@@ -324,6 +417,7 @@ class FusedMixedLinear(nn.Module):
         marlin_data: Optional[dict[str, torch.Tensor]],
         fused_data: Optional[dict[str, torch.Tensor | float | int]],
         w_fp16_fp16: Optional[torch.Tensor] = None,
+        w_prefill_fp16: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
 
@@ -340,6 +434,9 @@ class FusedMixedLinear(nn.Module):
             self.bias = nn.Parameter(bias.clone())
         else:
             self.bias = None
+
+        if w_prefill_fp16 is not None:
+            self.register_buffer("_prefill_weight", w_prefill_fp16)
 
         self._has_marlin = marlin_data is not None
         self._has_fused = fused_data is not None
@@ -579,14 +676,27 @@ class FusedMixedLinear(nn.Module):
         y_permuted = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         return y_permuted.index_select(-1, self.inv_perm)
 
+    def _forward_dense_prefill(self, x_in: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "_prefill_weight"):
+            raise RuntimeError("Dense prefill weight is not available")
+        x_prefill = (
+            x_in
+            if x_in.dtype == self._prefill_weight.dtype
+            else x_in.to(self._prefill_weight.dtype)
+        )
+        return F.linear(x_prefill, self._prefill_weight)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_shape = x.shape
         x_2d = x.reshape(-1, self.K)
-        x_half = x_2d.half() if x_2d.dtype != torch.float16 else x_2d
 
-        if self._can_use_fused(x_2d):
+        if x_2d.size(0) > 1 and hasattr(self, "_prefill_weight"):
+            y = self._forward_dense_prefill(x_2d)
+        elif self._can_use_fused(x_2d):
+            x_half = x_2d.half() if x_2d.dtype != torch.float16 else x_2d
             y = self._forward_fused_gemv(x_half)
         elif self._has_marlin and _check_vllm() and x_2d.is_cuda:
+            x_half = x_2d.half() if x_2d.dtype != torch.float16 else x_2d
             y = self._forward_marlin(x_half)
         else:
             raise RuntimeError("No compatible fused/Marlin backend available")
@@ -608,6 +718,7 @@ def load_for_inference(
     device: str = "cuda",
     use_marlin: bool = True,
     use_fused_gemv: bool = True,
+    use_dense_prefill: bool = True,
 ) -> nn.Module:
     """Load a packed RDQuant checkpoint for inference.
 
@@ -628,6 +739,9 @@ def load_for_inference(
         use_fused_gemv: If True, use the fused mixed-GEMV decode path on
             eligible layers and fall back to Marlin for prefill / ineligible
             shapes.
+        use_dense_prefill: If True, also materialize one FP16 weight matrix per
+            quantized layer and use ``F.linear`` for ``M > 1`` prefill. This
+            improves prefill latency at the cost of additional VRAM.
 
     Returns:
         The HuggingFace model ready for inference.
@@ -648,6 +762,7 @@ def load_for_inference(
 
     # 2. Load HF model architecture (empty weights)
     config = AutoConfig.from_pretrained(checkpoint_dir)
+    model_dtype = _normalize_torch_dtype(getattr(config, "torch_dtype", torch.bfloat16))
     with torch.device("meta"):
         model = model_class.from_config(config)
     # Materialise on CPU first with empty weights
@@ -689,6 +804,11 @@ def load_for_inference(
 
         # Packed-kernel path: build directly from checkpoint tensors without
         # materialising dequantized FP16 weights.
+        materialized = (
+            _materialize_packed_groups(layer_data, splits, n_in)
+            if use_dense_prefill or not can_marlin
+            else {}
+        )
         if can_marlin:
             marlin_data = build_marlin_data(layer_data, {**splits}, n_in, target_device)
             fused_data = (
@@ -702,8 +822,23 @@ def load_for_inference(
                     bias_tensor = bias_tensor.to(target_device)
 
                 w_fp16_buf = None
-                if splits.get("FP16", 0) > 0 and "weight_fp16" in layer_data:
-                    w_fp16_buf = layer_data["weight_fp16"].half().to(target_device)
+                if materialized.get("w_fp16") is not None:
+                    w_fp16_buf = materialized["w_fp16"].to(target_device)
+
+                w_prefill_buf = None
+                if use_dense_prefill:
+                    pieces = [
+                        materialized.get("w_nvfp4"),
+                        materialized.get("w_fp8"),
+                        materialized.get("w_fp16"),
+                    ]
+                    pieces = [piece for piece in pieces if piece is not None]
+                    if pieces:
+                        w_prefill_buf = (
+                            torch.cat(pieces, dim=0)[inv_perm]
+                            .to(device=target_device, dtype=model_dtype)
+                            .contiguous()
+                        )
 
                 packed_layer = FusedMixedLinear(
                     n_nvfp4=splits.get("NVFP4", 0),
@@ -715,63 +850,17 @@ def load_for_inference(
                     marlin_data=marlin_data,
                     fused_data=fused_data,
                     w_fp16_fp16=w_fp16_buf,
+                    w_prefill_fp16=w_prefill_buf,
                 )
                 _set_module(model, layer_name, packed_layer)
                 continue
 
         # --- Dequantize each group ---
-        w_nvfp4 = None
-        w_fp8 = None
-        w_fp16 = None
-        raw_nvfp4_scales = None
-        nvfp4_packed_indices = None
-
-        n_nvfp4 = splits.get("NVFP4", 0)
-        if n_nvfp4 > 0:
-            packed = layer_data["weight_nvfp4"]  # [n_ch, K//2] uint8
-            scales_uint8 = layer_data["weight_nvfp4_scale"]  # [n_ch, K//16] as uint8
-            scales_fp8 = scales_uint8.view(torch.float8_e4m3fn)
-            scales_f32 = scales_fp8.to(torch.float32)  # [n_ch, K//16]
-            global_scale = layer_data["nvfp4_global_scale"].item()
-
-            if can_marlin:
-                # For Marlin: pass packed indices + raw_scales directly
-                nvfp4_packed_indices = packed
-                raw_nvfp4_scales = scales_f32  # [n_ch, K//16] — these are already absmax/6.0
-
-            # Dequantize for fake-quant or FP16 materialisation
-            # Unpack nibbles
-            even = (packed & 0x0F).to(torch.int64)
-            odd = ((packed >> 4) & 0x0F).to(torch.int64)
-            n_ch = packed.shape[0]
-            half_k = packed.shape[1]
-            indices_2d = torch.empty(n_ch, half_k * 2, dtype=torch.int64)
-            indices_2d[:, 0::2] = even
-            indices_2d[:, 1::2] = odd
-
-            # Dequantize using LUT
-            from rdquant.core.formats import _NVFP4_LUT, _NVFP4_BLOCK_SIZE
-            lut = _NVFP4_LUT
-            values = lut[indices_2d.reshape(-1)].reshape(n_ch, n_in)
-            # Apply block scales: each scale covers 16 elements
-            blocks_per_row = n_in // _NVFP4_BLOCK_SIZE
-            scales_expanded = scales_f32.unsqueeze(-1).expand(
-                n_ch, blocks_per_row, _NVFP4_BLOCK_SIZE
-            ).reshape(n_ch, n_in)
-            w_nvfp4 = (values * scales_expanded).half()
-
-        n_fp8 = splits.get("FP8", 0)
-        if n_fp8 > 0:
-            data_uint8 = layer_data["weight_fp8"]  # [n_ch, K] as uint8
-            data_fp8 = data_uint8.view(torch.float8_e4m3fn)
-            data_f32 = data_fp8.to(torch.float32)
-            scale_vec = layer_data["weight_fp8_scale"]  # [n_ch] float32
-            w_fp8 = (data_f32 * scale_vec.unsqueeze(1)).half()
-
-        n_fp16 = splits.get("FP16", 0)
-        if n_fp16 > 0:
-            data_bf16 = layer_data["weight_fp16"]  # [n_ch, K] bfloat16
-            w_fp16 = data_bf16.half()
+        w_nvfp4 = materialized.get("w_nvfp4")
+        w_fp8 = materialized.get("w_fp8")
+        w_fp16 = materialized.get("w_fp16")
+        raw_nvfp4_scales = materialized.get("raw_nvfp4_scales")
+        nvfp4_packed_indices = materialized.get("nvfp4_packed_indices")
 
         if can_marlin:
             # Build MarlinMixedLinear
@@ -801,6 +890,16 @@ def load_for_inference(
                 bias=bias_tensor,
                 raw_nvfp4_scales=raw_nvfp4_scales,
                 nvfp4_packed_indices=nvfp4_packed_indices,
+                w_prefill_fp16=(
+                    torch.cat(
+                        [piece for piece in (w_nvfp4, w_fp8, w_fp16) if piece is not None],
+                        dim=0,
+                    )[inv_perm]
+                    .to(device=target_device, dtype=model_dtype)
+                    .contiguous()
+                    if use_dense_prefill and any(piece is not None for piece in (w_nvfp4, w_fp8, w_fp16))
+                    else None
+                ),
             )
             _set_module(model, layer_name, marlin_layer)
         else:

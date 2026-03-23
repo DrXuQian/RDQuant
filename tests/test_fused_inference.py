@@ -249,6 +249,45 @@ def test_fused_mixed_linear_prefill_matches_marlin_fallback():
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available() or not _check_vllm(),
+    reason="requires CUDA + vLLM",
+)
+def test_fused_mixed_linear_prefill_uses_dense_prefill_weight():
+    device = "cuda"
+    n_fp4, n_fp8, k = 64, 64, 256
+    splits = {"NVFP4": n_fp4, "FP8": n_fp8, "FP16": 0}
+    layer_data = _make_valid_layer_data(n_fp4, n_fp8, k)
+    marlin_data = build_marlin_data(layer_data, splits, k, device)
+    fused_data = pack_for_fused_gemv(layer_data, splits, k, device)
+    from rdquant.inference import _materialize_packed_groups
+
+    materialized = _materialize_packed_groups(layer_data, splits, k)
+    pieces = [piece for piece in (materialized["w_nvfp4"], materialized["w_fp8"], materialized["w_fp16"]) if piece is not None]
+    w_prefill = torch.cat(pieces, dim=0)[layer_data["inv_permutation"].to(torch.int64)].half().to(device)
+
+    mod = FusedMixedLinear(
+        n_nvfp4=n_fp4,
+        n_fp8=n_fp8,
+        n_fp16=0,
+        k=k,
+        inv_perm=layer_data["inv_permutation"].to(device=device, dtype=torch.int64),
+        bias=None,
+        marlin_data=marlin_data,
+        fused_data=fused_data,
+        w_fp16_fp16=None,
+        w_prefill_fp16=w_prefill,
+    ).to(device)
+    mod.eval()
+
+    x = torch.randn(2, k, device=device, dtype=torch.float16)
+    y = mod(x)
+    y_ref = mod._forward_dense_prefill(x)
+
+    assert hasattr(mod, "_prefill_weight")
+    assert torch.equal(y, y_ref)
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available() or not _check_vllm() or not fused_gemv_available(),
     reason="requires CUDA + vLLM + rdquant CUDA extension",
 )
@@ -270,6 +309,7 @@ def test_load_for_inference_replaces_layer_with_fused_module():
     assert isinstance(model.fc, FusedMixedLinear)
     assert model.fc._has_marlin
     assert model.fc._has_fused
+    assert hasattr(model.fc, "_prefill_weight")
 
     x_decode = torch.randn(1, 256, device=device, dtype=torch.float16)
     x_prefill = torch.randn(2, 256, device=device, dtype=torch.float16)
@@ -278,7 +318,7 @@ def test_load_for_inference_replaces_layer_with_fused_module():
     y_prefill = model(x_prefill)
 
     y_decode_ref = model.fc._forward_fused_gemv(x_decode)
-    y_prefill_ref = model.fc._forward_marlin(x_prefill)
+    y_prefill_ref = model.fc._forward_dense_prefill(x_prefill)
 
     assert torch.equal(y_decode, y_decode_ref + model.fc.bias)
-    assert torch.equal(y_prefill, y_prefill_ref + model.fc.bias)
+    assert torch.equal(y_prefill, (y_prefill_ref + model.fc.bias).to(x_prefill.dtype))
