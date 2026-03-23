@@ -175,6 +175,11 @@ def _choose_uint4_parallel_k(n_combined: int, k: int) -> int:
     return min(parallel_k, 16)
 
 
+def _should_use_nonpersistent_uint4(m: int) -> bool:
+    """Use the fused UINT4 lane for decode and lightly batched decode."""
+    return m <= 4
+
+
 class Int4MarlinLinear(nn.Module):
     """Single-Marlin-launch mixed INT4/INT8 linear layer."""
 
@@ -254,7 +259,7 @@ class Int4MarlinLinear(nn.Module):
 
     def _forward_fused(self, x_2d, M, orig_dtype, orig_shape):
         """Forward with fused pre/post-processing CUDA kernels (v2)."""
-        if self.use_nonpersistent_gemv and M == 1:
+        if self.use_nonpersistent_gemv and _should_use_nonpersistent_uint4(M):
             inv_awq = self.inv_awq_scales if self.inv_awq_scales is not None else x_2d.new_empty(0)
             y_out = self._fused.fused_uint4_decode(
                 x_2d, inv_awq,
